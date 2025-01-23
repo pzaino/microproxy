@@ -1,0 +1,8 @@
+# IDEs
+.vscode/
+.idea/
+.ds_store
+
+# old files
+*.old
+
