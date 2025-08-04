@@ -3,6 +3,8 @@ package config
 import (
 	"encoding/json"
 	"fmt"
+	"math/rand"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -27,11 +29,36 @@ type ProxyConfig struct {
 	AuthType    string `json:"auth_type" yaml:"auth_type"`
 }
 
-// UpstreamProxyConfig holds the configuration for the proxy server
+type LoginRule struct {
+	IPRange  string `json:"ip_range" yaml:"ip_range"` // e.g. "192.168.1.0/24"
+	Username string `json:"username" yaml:"username"` // supports ${SESSION_ID} placeholder
+	Password string `json:"password" yaml:"password"` // optional, can be empty
+}
+
 type UpstreamProxyConfig struct {
-	UpstreamProxy string `json:"upstream_proxy" yaml:"upstream_proxy"`
-	Username      string `json:"username" yaml:"username"`
-	Password      string `json:"password" yaml:"password"`
+	Proxies []string    `json:"proxies" yaml:"proxies"` // list of proxy URLs
+	Logins  []LoginRule `json:"logins" yaml:"logins"`   // login rules by client subnet
+}
+
+func (cfg *UpstreamProxyConfig) GetCredentialsFor(ip net.IP) (string, string) {
+	for _, rule := range cfg.Logins {
+		_, ipNet, err := net.ParseCIDR(rule.IPRange)
+		if err != nil {
+			continue
+		}
+		if ipNet.Contains(ip) {
+			return resolveSessionID(rule.Username), rule.Password
+		}
+	}
+	return "", ""
+}
+
+func resolveSessionID(username string) string {
+	return strings.ReplaceAll(username, "${SESSION_ID}", generateSessionID())
+}
+
+func generateSessionID() string {
+	return fmt.Sprintf("session-%d", rand.Intn(99999999))
 }
 
 // NewConfig returns a new Config instance
@@ -47,9 +74,7 @@ func NewConfig() *Config {
 			AuthType:    "",
 		},
 		UpstreamProxy: UpstreamProxyConfig{
-			UpstreamProxy: "",
-			Username:      "",
-			Password:      "",
+			Proxies: []string{},
 		},
 	}
 }
