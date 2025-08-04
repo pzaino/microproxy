@@ -177,7 +177,11 @@ func main() {
 	http.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintf(w, "requests_total %d\nresponses_total %d\n", reqCount, respCount)
 	})
-	go http.ListenAndServe(":9091", nil)
+	go func() {
+		if err := http.ListenAndServe(":9091", nil); err != nil {
+			log.Printf("Metrics server error: %v", err)
+		}
+	}()
 
 	server := &http.Server{
 		Addr:         addr,
