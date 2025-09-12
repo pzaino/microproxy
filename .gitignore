@@ -6,3 +6,7 @@
 # old files
 *.old
 
+# build and testing artifacts
+config.yaml
+microproxy
+
