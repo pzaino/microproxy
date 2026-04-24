@@ -2,8 +2,12 @@ package config
 
 import (
 	"os"
+	"regexp"
+	"strings"
 	"testing"
 )
+
+var sessionIDPattern = regexp.MustCompile(`^session-[A-Za-z0-9_-]+$`)
 
 func TestLoadYAMLConfigLegacyBackCompat(t *testing.T) {
 	tempFile := "test_config.yaml"
@@ -69,5 +73,44 @@ microproxy:
 	}
 	if login.Password != "pass" {
 		t.Errorf("expected password 'pass', got %s", login.Password)
+	}
+}
+
+func TestGenerateSessionIDFormat(t *testing.T) {
+	sessionID := generateSessionID()
+
+	if !strings.HasPrefix(sessionID, sessionIDPrefix) {
+		t.Fatalf("expected session id to start with %q, got %q", sessionIDPrefix, sessionID)
+	}
+
+	if !sessionIDPattern.MatchString(sessionID) {
+		t.Fatalf("expected session id to match url-safe charset, got %q", sessionID)
+	}
+
+	wantLen := len(sessionIDPrefix) + 22 // base64.RawURLEncoding length for 16 random bytes.
+	if len(sessionID) != wantLen {
+		t.Fatalf("expected session id length %d, got %d (%q)", wantLen, len(sessionID), sessionID)
+	}
+}
+
+func TestResolveSessionIDReplacesPlaceholdersWithStableFormat(t *testing.T) {
+	resolved := resolveSessionID("user:${SESSION_ID}:region:${SESSION_ID}")
+	if strings.Contains(resolved, "${SESSION_ID}") {
+		t.Fatalf("expected all placeholders replaced, got %q", resolved)
+	}
+
+	matches := regexp.MustCompile(`session-[A-Za-z0-9_-]+`).FindAllString(resolved, -1)
+	if len(matches) != 2 {
+		t.Fatalf("expected 2 generated session ids, got %d in %q", len(matches), resolved)
+	}
+
+	wantLen := len(sessionIDPrefix) + 22 // base64.RawURLEncoding length for 16 random bytes.
+	for i, match := range matches {
+		if !sessionIDPattern.MatchString(match) {
+			t.Fatalf("expected substituted session id #%d to match format, got %q", i+1, match)
+		}
+		if len(match) != wantLen {
+			t.Fatalf("expected substituted session id #%d length %d, got %d", i+1, wantLen, len(match))
+		}
 	}
 }

@@ -1,9 +1,10 @@
 package config
 
 import (
+	"crypto/rand"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
-	"math/rand"
 	"net"
 	"net/url"
 	"os"
@@ -14,6 +15,11 @@ import (
 )
 
 const defaultSchemaVersion = "1"
+
+const (
+	sessionIDPrefix      = "session-"
+	sessionIDEntropyByte = 16
+)
 
 // Config holds the configuration for the proxy server.
 //
@@ -227,8 +233,21 @@ func resolveSessionID(username string) string {
 	return strings.ReplaceAll(username, "${SESSION_ID}", generateSessionID())
 }
 
+// generateSessionID returns a URL-safe session identifier for ${SESSION_ID} substitution.
+//
+// Format guarantees:
+//   - Always prefixed with "session-".
+//   - Random segment is base64.RawURLEncoding (characters [A-Za-z0-9_-], no padding).
+//
+// Entropy guarantee:
+//   - Uses 16 bytes from crypto/rand (128 bits of entropy) for the random segment.
 func generateSessionID() string {
-	return fmt.Sprintf("session-%d", rand.Intn(99999999))
+	b := make([]byte, sessionIDEntropyByte)
+	if _, err := rand.Read(b); err != nil {
+		panic(fmt.Errorf("generate session id: %w", err))
+	}
+
+	return sessionIDPrefix + base64.RawURLEncoding.EncodeToString(b)
 }
 
 // NewConfig returns a new Config instance.
