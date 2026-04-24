@@ -5,7 +5,7 @@ import (
 	"testing"
 )
 
-func TestLoadYAMLConfig(t *testing.T) {
+func TestLoadYAMLConfigLegacyBackCompat(t *testing.T) {
 	tempFile := "test_config.yaml"
 	data := []byte(`
 upstream_proxy:
@@ -18,7 +18,7 @@ upstream_proxy:
 microproxy:
   http_proto: ":9090"
 `)
-	err := os.WriteFile(tempFile, data, 0644)
+	err := os.WriteFile(tempFile, data, 0o644)
 	if err != nil {
 		t.Fatalf("failed to write config file: %v", err)
 	}
@@ -29,16 +29,35 @@ microproxy:
 		t.Fatalf("failed to load config: %v", err)
 	}
 
+	if cfg.SchemaVersion == "" {
+		t.Fatal("expected schema_version to be set by compatibility loader")
+	}
+
 	if cfg.MicroProxy.HTTPProto != ":9090" {
 		t.Errorf("expected :9090, got %s", cfg.MicroProxy.HTTPProto)
+	}
+
+	if len(cfg.Listeners) != 1 || cfg.Listeners[0].Address != ":9090" {
+		t.Fatalf("expected legacy listener mapped to :9090, got %+v", cfg.Listeners)
 	}
 
 	if len(cfg.UpstreamProxy.Proxies) != 1 || cfg.UpstreamProxy.Proxies[0] != "http://proxy.example.com:8080" {
 		t.Errorf("expected proxy 'http://proxy.example.com:8080', got %v", cfg.UpstreamProxy.Proxies)
 	}
 
+	if len(cfg.Providers) != 1 {
+		t.Fatalf("expected legacy providers to map to typed providers, got %d", len(cfg.Providers))
+	}
+	if got := cfg.Providers[0].Endpoints[0].URL; got != "http://proxy.example.com:8080" {
+		t.Fatalf("expected endpoint URL mapped from legacy proxy, got %s", got)
+	}
+
 	if len(cfg.UpstreamProxy.Logins) != 1 {
 		t.Fatalf("expected 1 login rule, got %d", len(cfg.UpstreamProxy.Logins))
+	}
+
+	if len(cfg.Policies) != 1 {
+		t.Fatalf("expected login rule to map to policy, got %d", len(cfg.Policies))
 	}
 
 	login := cfg.UpstreamProxy.Logins[0]
