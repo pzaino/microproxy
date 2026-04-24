@@ -161,6 +161,55 @@ type UpstreamProxyConfig struct {
 	Logins  []LoginRule `json:"logins" yaml:"logins"`   // login rules by client subnet
 }
 
+type FieldValidationError struct {
+	Field   string `json:"field"`
+	Message string `json:"message"`
+}
+
+func (e FieldValidationError) Error() string {
+	if strings.TrimSpace(e.Field) == "" {
+		return e.Message
+	}
+	return fmt.Sprintf("%s: %s", e.Field, e.Message)
+}
+
+type ValidationErrors struct {
+	Errors []FieldValidationError `json:"errors"`
+}
+
+func (e *ValidationErrors) Error() string {
+	if e == nil || len(e.Errors) == 0 {
+		return ""
+	}
+
+	parts := make([]string, 0, len(e.Errors))
+	for _, fieldErr := range e.Errors {
+		parts = append(parts, fieldErr.Error())
+	}
+	return strings.Join(parts, "; ")
+}
+
+func (e *ValidationErrors) Add(field, message string) {
+	if strings.TrimSpace(message) == "" {
+		return
+	}
+	e.Errors = append(e.Errors, FieldValidationError{Field: field, Message: message})
+}
+
+func (e *ValidationErrors) Merge(other *ValidationErrors) {
+	if e == nil || other == nil || len(other.Errors) == 0 {
+		return
+	}
+	e.Errors = append(e.Errors, other.Errors...)
+}
+
+func (e *ValidationErrors) OrNil() error {
+	if e == nil || len(e.Errors) == 0 {
+		return nil
+	}
+	return e
+}
+
 func (cfg *UpstreamProxyConfig) GetCredentialsFor(ip net.IP) (string, string) {
 	for _, rule := range cfg.Logins {
 		_, ipNet, err := net.ParseCIDR(rule.IPRange)
@@ -208,8 +257,7 @@ func NewConfig() *Config {
 // LoadConfig loads the configuration from the given file.
 func LoadConfig(file string) (*Config, error) {
 	c := NewConfig()
-	err := c.Load(file)
-	if err != nil {
+	if err := c.Load(file); err != nil {
 		return nil, err
 	}
 
@@ -324,69 +372,309 @@ func legacyListener(protoType, addr string, cfg ProxyConfig, defaultEnabled bool
 
 // Validate ensures configuration is safe to bootstrap.
 func (c *Config) Validate() error {
+	errs := &ValidationErrors{}
+
 	if c == nil {
-		return fmt.Errorf("config is nil")
+		errs.Add("config", "is nil")
+		return errs
 	}
 
 	if strings.TrimSpace(c.SchemaVersion) == "" {
-		return fmt.Errorf("schema_version cannot be empty")
+		errs.Add("schema_version", "cannot be empty")
 	}
 
 	if len(c.Listeners) == 0 {
-		return fmt.Errorf("at least one listener must be configured")
+		errs.Add("listeners", "at least one listener must be configured")
 	}
 
+	listenerNameSeen := map[string]int{}
 	for idx, listener := range c.Listeners {
-		if strings.TrimSpace(listener.Type) == "" {
-			return fmt.Errorf("listeners[%d].type cannot be empty", idx)
-		}
-		if strings.TrimSpace(listener.Address) == "" {
-			return fmt.Errorf("listeners[%d].address cannot be empty", idx)
-		}
-		if err := validateAddr(listener.Address, fmt.Sprintf("listeners[%d].address", idx)); err != nil {
-			return err
-		}
-		if listener.Type == "https" {
-			if listener.TLS == nil {
-				return fmt.Errorf("listeners[%d].tls is required for https listeners", idx)
+		errs.Merge(listener.Validate(fmt.Sprintf("listeners[%d]", idx)))
+		if name := strings.TrimSpace(listener.Name); name != "" {
+			if seenIdx, exists := listenerNameSeen[name]; exists {
+				errs.Add(fmt.Sprintf("listeners[%d].name", idx), fmt.Sprintf("duplicates listeners[%d].name", seenIdx))
 			}
-			if (listener.TLS.CertFile == "") != (listener.TLS.KeyFile == "") {
-				return fmt.Errorf("listeners[%d].tls.cert_file and listeners[%d].tls.key_file must both be set", idx, idx)
-			}
+			listenerNameSeen[name] = idx
 		}
 	}
 
+	providerNameSeen := map[string]int{}
 	for idx, provider := range c.Providers {
-		if strings.TrimSpace(provider.Type) == "" {
-			return fmt.Errorf("providers[%d].type cannot be empty", idx)
-		}
-		if len(provider.Endpoints) == 0 {
-			return fmt.Errorf("providers[%d].endpoints must contain at least one endpoint", idx)
-		}
-		for endpointIdx, endpoint := range provider.Endpoints {
-			if strings.TrimSpace(endpoint.URL) == "" {
-				return fmt.Errorf("providers[%d].endpoints[%d].url cannot be empty", idx, endpointIdx)
+		errs.Merge(provider.Validate(fmt.Sprintf("providers[%d]", idx)))
+		if name := strings.TrimSpace(provider.Name); name != "" {
+			if seenIdx, exists := providerNameSeen[name]; exists {
+				errs.Add(fmt.Sprintf("providers[%d].name", idx), fmt.Sprintf("duplicates providers[%d].name", seenIdx))
 			}
-			u, err := url.Parse(endpoint.URL)
-			if err != nil || u.Scheme == "" || u.Host == "" {
-				return fmt.Errorf("providers[%d].endpoints[%d].url must be a valid URL", idx, endpointIdx)
-			}
-		}
-		if provider.Health.IntervalSeconds < 0 || provider.Health.TimeoutSeconds < 0 || provider.Health.FailureThreshold < 0 {
-			return fmt.Errorf("providers[%d].health values cannot be negative", idx)
+			providerNameSeen[name] = idx
 		}
 	}
 
-	for idx, rule := range c.UpstreamProxy.Logins {
-		if strings.TrimSpace(rule.IPRange) == "" {
-			return fmt.Errorf("upstream_proxy.logins[%d].ip_range cannot be empty", idx)
-		}
-		if _, _, err := net.ParseCIDR(rule.IPRange); err != nil {
-			return fmt.Errorf("upstream_proxy.logins[%d].ip_range must be a valid CIDR: %w", idx, err)
+	policyNameSeen := map[string]int{}
+	for idx, policy := range c.Policies {
+		errs.Merge(policy.Validate(fmt.Sprintf("policies[%d]", idx)))
+		if name := strings.TrimSpace(policy.Name); name != "" {
+			if seenIdx, exists := policyNameSeen[name]; exists {
+				errs.Add(fmt.Sprintf("policies[%d].name", idx), fmt.Sprintf("duplicates policies[%d].name", seenIdx))
+			}
+			policyNameSeen[name] = idx
 		}
 	}
 
-	return nil
+	tenantIDSeen := map[string]int{}
+	for idx, tenant := range c.Tenants {
+		errs.Merge(tenant.Validate(fmt.Sprintf("tenants[%d]", idx)))
+		if id := strings.TrimSpace(tenant.ID); id != "" {
+			if seenIdx, exists := tenantIDSeen[id]; exists {
+				errs.Add(fmt.Sprintf("tenants[%d].id", idx), fmt.Sprintf("duplicates tenants[%d].id", seenIdx))
+			}
+			tenantIDSeen[id] = idx
+		}
+	}
+
+	errs.Merge(c.Routing.Validate("routing", providerNameSeen, policyNameSeen))
+	errs.Merge(c.UpstreamProxy.Validate("upstream_proxy"))
+
+	return errs.OrNil()
+}
+
+func (l ListenerConfig) Validate(fieldPath string) *ValidationErrors {
+	errs := &ValidationErrors{}
+
+	if strings.TrimSpace(l.Name) == "" {
+		errs.Add(fieldPath+".name", "cannot be empty")
+	}
+
+	proto := strings.ToLower(strings.TrimSpace(l.Type))
+	switch proto {
+	case "http", "https", "socks5":
+	default:
+		errs.Add(fieldPath+".type", "must be one of: http, https, socks5")
+	}
+
+	if strings.TrimSpace(l.Address) == "" {
+		errs.Add(fieldPath+".address", "cannot be empty")
+	} else if err := validateAddr(l.Address, fieldPath+".address"); err != nil {
+		errs.Add(fieldPath+".address", err.Error())
+	}
+
+	if proto == "https" {
+		if l.TLS == nil {
+			errs.Add(fieldPath+".tls", "is required for https listeners")
+		} else {
+			errs.Merge(l.TLS.Validate(fieldPath + ".tls"))
+		}
+	} else if l.TLS != nil {
+		errs.Add(fieldPath+".tls", "must only be set for https listeners")
+	}
+
+	return errs
+}
+
+func (t *TLSConfig) Validate(fieldPath string) *ValidationErrors {
+	errs := &ValidationErrors{}
+
+	if t == nil {
+		errs.Add(fieldPath, "cannot be nil")
+		return errs
+	}
+
+	certSet := strings.TrimSpace(t.CertFile) != ""
+	keySet := strings.TrimSpace(t.KeyFile) != ""
+	if certSet != keySet {
+		errs.Add(fieldPath, "cert_file and key_file must both be set")
+	}
+
+	return errs
+}
+
+func (p ProviderConfig) Validate(fieldPath string) *ValidationErrors {
+	errs := &ValidationErrors{}
+
+	if strings.TrimSpace(p.Name) == "" {
+		errs.Add(fieldPath+".name", "cannot be empty")
+	}
+	if strings.TrimSpace(p.Type) == "" {
+		errs.Add(fieldPath+".type", "cannot be empty")
+	}
+	if len(p.Endpoints) == 0 {
+		errs.Add(fieldPath+".endpoints", "must contain at least one endpoint")
+	}
+
+	for idx, endpoint := range p.Endpoints {
+		errs.Merge(endpoint.Validate(fmt.Sprintf("%s.endpoints[%d]", fieldPath, idx)))
+	}
+
+	errs.Merge(p.Auth.Validate(fieldPath + ".auth"))
+	errs.Merge(p.Health.Validate(fieldPath + ".health"))
+	return errs
+}
+
+func (a ProviderAuthConfig) Validate(fieldPath string) *ValidationErrors {
+	errs := &ValidationErrors{}
+
+	switch strings.ToLower(strings.TrimSpace(a.Type)) {
+	case "", "none":
+		return errs
+	case "basic":
+		if strings.TrimSpace(a.Username) == "" {
+			errs.Add(fieldPath+".username", "is required for basic auth")
+		}
+		if strings.TrimSpace(a.Password) == "" {
+			errs.Add(fieldPath+".password", "is required for basic auth")
+		}
+	case "bearer":
+		if strings.TrimSpace(a.Token) == "" {
+			errs.Add(fieldPath+".token", "is required for bearer auth")
+		}
+	case "api_key":
+		if len(a.Headers) == 0 {
+			errs.Add(fieldPath+".headers", "must contain at least one header for api_key auth")
+		}
+	default:
+		errs.Add(fieldPath+".type", "must be one of: none, basic, bearer, api_key")
+	}
+
+	return errs
+}
+
+func (e ProviderEndpoint) Validate(fieldPath string) *ValidationErrors {
+	errs := &ValidationErrors{}
+
+	if strings.TrimSpace(e.URL) == "" {
+		errs.Add(fieldPath+".url", "cannot be empty")
+	} else {
+		parsed, err := url.Parse(e.URL)
+		if err != nil || strings.TrimSpace(parsed.Scheme) == "" || strings.TrimSpace(parsed.Host) == "" {
+			errs.Add(fieldPath+".url", "must be a valid URL with scheme and host")
+		}
+	}
+
+	if e.Priority < 0 {
+		errs.Add(fieldPath+".priority", "cannot be negative")
+	}
+	if e.Weight < 0 {
+		errs.Add(fieldPath+".weight", "cannot be negative")
+	}
+
+	return errs
+}
+
+func (h ProviderHealthConfig) Validate(fieldPath string) *ValidationErrors {
+	errs := &ValidationErrors{}
+
+	if h.IntervalSeconds < 0 {
+		errs.Add(fieldPath+".interval_seconds", "cannot be negative")
+	}
+	if h.TimeoutSeconds < 0 {
+		errs.Add(fieldPath+".timeout_seconds", "cannot be negative")
+	}
+	if h.FailureThreshold < 0 {
+		errs.Add(fieldPath+".failure_threshold", "cannot be negative")
+	}
+
+	return errs
+}
+
+func (r RoutingConfig) Validate(fieldPath string, providerNames map[string]int, policyNames map[string]int) *ValidationErrors {
+	errs := &ValidationErrors{}
+
+	if p := strings.TrimSpace(r.DefaultProvider); p != "" {
+		if _, ok := providerNames[p]; !ok {
+			errs.Add(fieldPath+".default_provider", "must reference an existing provider name")
+		}
+	}
+
+	ruleNameSeen := map[string]int{}
+	for idx, rule := range r.Rules {
+		rulePath := fmt.Sprintf("%s.rules[%d]", fieldPath, idx)
+		errs.Merge(rule.Validate(rulePath, providerNames, policyNames))
+		if name := strings.TrimSpace(rule.Name); name != "" {
+			if seenIdx, exists := ruleNameSeen[name]; exists {
+				errs.Add(rulePath+".name", fmt.Sprintf("duplicates %s.rules[%d].name", fieldPath, seenIdx))
+			}
+			ruleNameSeen[name] = idx
+		}
+	}
+
+	return errs
+}
+
+func (r RoutingRule) Validate(fieldPath string, providerNames map[string]int, policyNames map[string]int) *ValidationErrors {
+	errs := &ValidationErrors{}
+
+	if strings.TrimSpace(r.Name) == "" {
+		errs.Add(fieldPath+".name", "cannot be empty")
+	}
+	if p := strings.TrimSpace(r.Provider); p == "" {
+		errs.Add(fieldPath+".provider", "cannot be empty")
+	} else if _, ok := providerNames[p]; !ok {
+		errs.Add(fieldPath+".provider", "must reference an existing provider name")
+	}
+	if policy := strings.TrimSpace(r.PolicyRef); policy != "" {
+		if _, ok := policyNames[policy]; !ok {
+			errs.Add(fieldPath+".policy_ref", "must reference an existing policy name")
+		}
+	}
+
+	for key, value := range r.Match {
+		if strings.Contains(strings.ToLower(key), "cidr") || strings.HasSuffix(strings.ToLower(key), "ip_range") {
+			if _, _, err := net.ParseCIDR(value); err != nil {
+				errs.Add(fieldPath+".match."+key, "must be a valid CIDR")
+			}
+		}
+	}
+
+	return errs
+}
+
+func (p PolicyConfig) Validate(fieldPath string) *ValidationErrors {
+	errs := &ValidationErrors{}
+
+	if strings.TrimSpace(p.Name) == "" {
+		errs.Add(fieldPath+".name", "cannot be empty")
+	}
+	if strings.TrimSpace(p.Type) == "" {
+		errs.Add(fieldPath+".type", "cannot be empty")
+	}
+	if strings.TrimSpace(p.Action) == "" {
+		errs.Add(fieldPath+".action", "cannot be empty")
+	}
+	if ipRange, ok := p.Selectors["ip_range"]; ok {
+		if _, _, err := net.ParseCIDR(ipRange); err != nil {
+			errs.Add(fieldPath+".selectors.ip_range", "must be a valid CIDR")
+		}
+	}
+
+	return errs
+}
+
+func (t TenantConfig) Validate(fieldPath string) *ValidationErrors {
+	errs := &ValidationErrors{}
+	if strings.TrimSpace(t.Name) == "" {
+		errs.Add(fieldPath+".name", "cannot be empty")
+	}
+	if strings.TrimSpace(t.ID) == "" {
+		errs.Add(fieldPath+".id", "cannot be empty")
+	}
+	return errs
+}
+
+func (u UpstreamProxyConfig) Validate(fieldPath string) *ValidationErrors {
+	errs := &ValidationErrors{}
+	for idx, rule := range u.Logins {
+		errs.Merge(rule.Validate(fmt.Sprintf("%s.logins[%d]", fieldPath, idx)))
+	}
+	return errs
+}
+
+func (r LoginRule) Validate(fieldPath string) *ValidationErrors {
+	errs := &ValidationErrors{}
+	if strings.TrimSpace(r.IPRange) == "" {
+		errs.Add(fieldPath+".ip_range", "cannot be empty")
+	} else if _, _, err := net.ParseCIDR(r.IPRange); err != nil {
+		errs.Add(fieldPath+".ip_range", "must be a valid CIDR")
+	}
+	return errs
 }
 
 func validateAddr(addr, field string) error {
@@ -396,7 +684,7 @@ func validateAddr(addr, field string) error {
 	}
 
 	if _, err := net.ResolveTCPAddr("tcp", addr); err != nil {
-		return fmt.Errorf("%s must be a valid listen address: %w", field, err)
+		return fmt.Errorf("%s must be a valid listen address", field)
 	}
 
 	return nil
