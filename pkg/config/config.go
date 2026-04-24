@@ -143,6 +143,7 @@ type TracingConfig struct {
 type HealthEndpointsConfig struct {
 	LivenessAddress  string `json:"liveness_address,omitempty" yaml:"liveness_address,omitempty"`
 	ReadinessAddress string `json:"readiness_address,omitempty" yaml:"readiness_address,omitempty"`
+	StartupAddress   string `json:"startup_address,omitempty" yaml:"startup_address,omitempty"`
 }
 
 // ProxyConfig holds the legacy listener configuration.

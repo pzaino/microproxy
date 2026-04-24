@@ -41,8 +41,8 @@ func run() error {
 		cfg.Observability.HealthEndpoints.LivenessAddress = healthAddr
 	}
 
-	dataPlaneManager := dataplane.NoopListenerManager{}
-	observabilityManager := observability.NoopListenerManager{}
+	observabilityManager := observability.NewListenerManager(cfg)
+	dataPlaneManager := dataplane.NewListenerManager(cfg)
 
 	svcCtx, stopSignals := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stopSignals()

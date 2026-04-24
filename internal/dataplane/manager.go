@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/pzaino/microproxy/internal/dataplane/listeners"
+	"github.com/pzaino/microproxy/internal/observability"
 	"github.com/pzaino/microproxy/pkg/config"
 )
 
@@ -67,16 +68,16 @@ func NewListenerManager(cfg *config.Config) ListenerManager {
 		return NoopListenerManager{}
 	}
 
-	return NewHTTPListenerManager(httpListeners, defaultDrainTimeout)
+	return NewHTTPListenerManager(httpListeners, defaultDrainTimeout, cfg.Observability.AccessLog.Enabled)
 }
 
-func NewHTTPListenerManager(listenerConfigs []config.ListenerConfig, drainTimeout time.Duration) *HTTPListenerManager {
+func NewHTTPListenerManager(listenerConfigs []config.ListenerConfig, drainTimeout time.Duration, accessLogEnabled bool) *HTTPListenerManager {
 	if drainTimeout <= 0 {
 		drainTimeout = defaultDrainTimeout
 	}
 
 	proxyHandler := listeners.NewForwardProxyHandler()
-	chain := listeners.MetadataMiddleware(proxyHandler)
+	chain := observability.HTTPMiddleware(listeners.MetadataMiddleware(proxyHandler), accessLogEnabled)
 
 	states := make([]*serverState, 0, len(listenerConfigs))
 	for _, listenerCfg := range listenerConfigs {
