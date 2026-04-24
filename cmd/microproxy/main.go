@@ -6,7 +6,6 @@ import (
 	"flag"
 	"fmt"
 	"log"
-	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
@@ -17,86 +16,57 @@ import (
 	"github.com/pzaino/microproxy/pkg/config"
 )
 
+const shutdownTimeout = 10 * time.Second
+
 func main() {
 	if err := run(); err != nil {
-		log.Printf("microproxy exited with error: %v", err)
-		os.Exit(1)
+		log.Fatalf("microproxy failed: %v", err)
 	}
 }
 
 func run() error {
-	configPath := flag.String("config", "", "path to configuration file (.yaml, .yml, .json)")
-	healthAddr := flag.String("health-addr", ":9090", "control-plane health server listen address")
+	var configPath string
+	var healthAddr string
+
+	flag.StringVar(&configPath, "config", "", "path to configuration file (.yaml/.yml/.json)")
+	flag.StringVar(&healthAddr, "health-addr", ":9090", "health endpoint listen address")
 	flag.Parse()
 
-	cfg, err := config.LoadConfig(*configPath)
+	cfg, err := config.LoadConfig(configPath)
 	if err != nil {
 		return fmt.Errorf("load config: %w", err)
 	}
 
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer stop()
+	if healthAddr != "" {
+		cfg.Observability.HealthEndpoints.LivenessAddress = healthAddr
+	}
 
-	dataplaneManager := dataplane.NoopListenerManager{}
+	dataPlaneManager := dataplane.NoopListenerManager{}
 	observabilityManager := observability.NoopListenerManager{}
 
-	if err := dataplaneManager.Start(ctx); err != nil {
-		return fmt.Errorf("start dataplane manager: %w", err)
+	svcCtx, stopSignals := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stopSignals()
+
+	if err := dataPlaneManager.Start(svcCtx); err != nil {
+		return fmt.Errorf("start data-plane manager: %w", err)
 	}
-	if err := observabilityManager.Start(ctx); err != nil {
+	if err := observabilityManager.Start(svcCtx); err != nil {
 		return fmt.Errorf("start observability manager: %w", err)
 	}
 
-	healthServer := newHealthServer(*healthAddr)
-	healthErrCh := make(chan error, 1)
-	go func() {
-		if err := healthServer.ListenAndServe(); !errors.Is(err, http.ErrServerClosed) {
-			healthErrCh <- err
-			return
-		}
-		healthErrCh <- nil
-	}()
+	<-svcCtx.Done()
+	log.Println("shutdown signal received; stopping managers")
 
-	log.Printf("microproxy bootstrap complete (http=%q https=%q socks5=%q health=%q)", cfg.MicroProxy.HTTPProto, cfg.MicroProxy.HTTPSProto, cfg.MicroProxy.SOCKS5Proto, *healthAddr)
-
-	select {
-	case err := <-healthErrCh:
-		if err != nil {
-			return fmt.Errorf("health server failed: %w", err)
-		}
-	case <-ctx.Done():
-	}
-
-	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 	defer cancel()
 
-	if err := healthServer.Shutdown(shutdownCtx); err != nil {
-		return fmt.Errorf("shutdown health server: %w", err)
-	}
+	var shutdownErr error
 	if err := observabilityManager.Shutdown(shutdownCtx); err != nil {
-		return fmt.Errorf("shutdown observability manager: %w", err)
+		shutdownErr = errors.Join(shutdownErr, fmt.Errorf("shutdown observability manager: %w", err))
 	}
-	if err := dataplaneManager.Shutdown(shutdownCtx); err != nil {
-		return fmt.Errorf("shutdown dataplane manager: %w", err)
+	if err := dataPlaneManager.Shutdown(shutdownCtx); err != nil {
+		shutdownErr = errors.Join(shutdownErr, fmt.Errorf("shutdown data-plane manager: %w", err))
 	}
 
-	return nil
-}
-
-func newHealthServer(addr string) *http.Server {
-	mux := http.NewServeMux()
-	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet {
-			w.WriteHeader(http.StatusMethodNotAllowed)
-			return
-		}
-		w.WriteHeader(http.StatusOK)
-		_, _ = w.Write([]byte("ok"))
-	})
-
-	return &http.Server{
-		Addr:              addr,
-		Handler:           mux,
-		ReadHeaderTimeout: 5 * time.Second,
-	}
+	return shutdownErr
 }

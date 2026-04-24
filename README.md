@@ -23,13 +23,19 @@ go build -o microproxy ./cmd/microproxy
 Run the MicroProxy server with the following command:
 
 ```bash
-./microproxy
+./microproxy -config ./config.yaml -health-addr :9090
 ```
 
-You can pass the optional flags below:
+You can also run directly from source:
+
+```bash
+go run ./cmd/microproxy -config ./config.yaml -health-addr :9090
+```
+
+Flags:
 
 - `-config`: path to a configuration file (`.yaml`, `.yml`, or `.json`).
-- `-health-addr`: control-plane health server listen address (default `:9090`).
+- `-health-addr`: health endpoint listen address (default `:9090`).
 
 ## Contributing
 
@@ -37,4 +43,6 @@ We welcome contributions! Please read our [contributing guidelines](CONTRIBUTING
 
 ## License
 
-This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for details.
+This project is copyright by Paolo Fabio Zaino, all rights reserved.
+
+This project is licensed under the MPL 2.0 License. See the [LICENSE](LICENSE) file for details.
