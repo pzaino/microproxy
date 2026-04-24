@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math/rand"
 	"net"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -83,7 +84,15 @@ func NewConfig() *Config {
 func LoadConfig(file string) (*Config, error) {
 	c := NewConfig()
 	err := c.Load(file)
-	return c, err
+	if err != nil {
+		return nil, err
+	}
+
+	if err := c.Validate(); err != nil {
+		return nil, err
+	}
+
+	return c, nil
 }
 
 // Load loads the configuration from the given file
@@ -108,4 +117,65 @@ func (c *Config) Load(file string) error {
 		err = fmt.Errorf("unsupported config file format: %s", ext)
 	}
 	return err
+}
+
+// Validate ensures configuration is safe to bootstrap.
+func (c *Config) Validate() error {
+	if c == nil {
+		return fmt.Errorf("config is nil")
+	}
+
+	if strings.TrimSpace(c.MicroProxy.HTTPProto) == "" &&
+		strings.TrimSpace(c.MicroProxy.HTTPSProto) == "" &&
+		strings.TrimSpace(c.MicroProxy.SOCKS5Proto) == "" {
+		return fmt.Errorf("at least one listener (http, https, or socks5) must be configured")
+	}
+
+	if err := validateAddr(c.MicroProxy.HTTPProto, "microproxy.http_proto"); err != nil {
+		return err
+	}
+	if err := validateAddr(c.MicroProxy.HTTPSProto, "microproxy.https_proto"); err != nil {
+		return err
+	}
+	if err := validateAddr(c.MicroProxy.SOCKS5Proto, "microproxy.socks5_proto"); err != nil {
+		return err
+	}
+
+	if (c.MicroProxy.CertFile == "") != (c.MicroProxy.KeyFile == "") {
+		return fmt.Errorf("microproxy.cert_file and microproxy.key_file must both be set for tls")
+	}
+
+	for idx, proxy := range c.UpstreamProxy.Proxies {
+		if strings.TrimSpace(proxy) == "" {
+			return fmt.Errorf("upstream_proxy.proxies[%d] cannot be empty", idx)
+		}
+		u, err := url.Parse(proxy)
+		if err != nil || u.Scheme == "" || u.Host == "" {
+			return fmt.Errorf("upstream_proxy.proxies[%d] must be a valid URL", idx)
+		}
+	}
+
+	for idx, rule := range c.UpstreamProxy.Logins {
+		if strings.TrimSpace(rule.IPRange) == "" {
+			return fmt.Errorf("upstream_proxy.logins[%d].ip_range cannot be empty", idx)
+		}
+		if _, _, err := net.ParseCIDR(rule.IPRange); err != nil {
+			return fmt.Errorf("upstream_proxy.logins[%d].ip_range must be a valid CIDR: %w", idx, err)
+		}
+	}
+
+	return nil
+}
+
+func validateAddr(addr, field string) error {
+	addr = strings.TrimSpace(addr)
+	if addr == "" {
+		return nil
+	}
+
+	if _, err := net.ResolveTCPAddr("tcp", addr); err != nil {
+		return fmt.Errorf("%s must be a valid listen address: %w", field, err)
+	}
+
+	return nil
 }

@@ -2,6 +2,8 @@
 .vscode/
 .idea/
 .ds_store
+attic/
+do.patch
 
 # old files
 *.old

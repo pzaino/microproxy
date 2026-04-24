@@ -1,195 +1,102 @@
 package main
 
 import (
-	"encoding/base64"
+	"context"
+	"errors"
+	"flag"
 	"fmt"
-	"io"
 	"log"
-	"math/rand"
-	"net"
 	"net/http"
-	"net/url"
 	"os"
 	"os/signal"
-	"regexp"
-	"sync"
-	"sync/atomic"
 	"syscall"
 	"time"
 
-	"github.com/elazarl/goproxy"
-	config "github.com/pzaino/microproxy/pkg/config"
-	"golang.org/x/net/proxy"
+	"github.com/pzaino/microproxy/internal/dataplane"
+	"github.com/pzaino/microproxy/internal/observability"
+	"github.com/pzaino/microproxy/pkg/config"
 )
-
-var (
-	reqCount  int64
-	respCount int64
-	configMu  sync.RWMutex
-	cfg       *config.Config
-)
-
-// ProxyManager manages a list of upstream proxies
-type ProxyManager struct {
-	proxies []string
-	current int
-	mutex   sync.Mutex
-}
-
-func NewProxyManager(proxies []string) *ProxyManager {
-	return &ProxyManager{proxies: proxies}
-}
-
-func (pm *ProxyManager) GetNextProxy() string {
-	pm.mutex.Lock()
-	defer pm.mutex.Unlock()
-	if len(pm.proxies) == 0 {
-		return ""
-	}
-	proxy := pm.proxies[pm.current]
-	pm.current = (pm.current + 1) % len(pm.proxies)
-	return proxy
-}
-
-func CustomRoundTripper(base *http.Transport) goproxy.RoundTripper {
-	return goproxy.RoundTripperFunc(func(req *http.Request, ctx *goproxy.ProxyCtx) (*http.Response, error) {
-		return base.RoundTrip(req)
-	})
-}
-
-func handleSignals(reload func()) {
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGHUP)
-	go func() {
-		for range sigCh {
-			log.Println("Reloading config due to SIGHUP")
-			reload()
-		}
-	}()
-}
-
-func reloadConfig(path string, pm *ProxyManager) {
-	configMu.Lock()
-	defer configMu.Unlock()
-	newCfg, err := config.LoadConfig(path)
-	if err != nil {
-		log.Printf("Failed to reload config: %v", err)
-		return
-	}
-	cfg = newCfg
-	pm.proxies = cfg.UpstreamProxy.Proxies
-	log.Println("Configuration reloaded successfully")
-}
-
-func startSOCKS5Listener(addr string, pm *ProxyManager) {
-	if addr == "" {
-		return
-	}
-	go func() {
-		log.Printf("SOCKS5 proxy listening on %s", addr)
-		dialer := proxy.Direct
-		ln, err := net.Listen("tcp", addr)
-		if err != nil {
-			log.Fatalf("Failed to start SOCKS5 listener: %v", err)
-		}
-		for {
-			conn, err := ln.Accept()
-			if err != nil {
-				log.Printf("SOCKS5 accept error: %v", err)
-				continue
-			}
-			go func(c net.Conn) {
-				defer c.Close()
-				upstream := pm.GetNextProxy()
-				up, _ := url.Parse(upstream)
-				t, err := dialer.Dial("tcp", up.Host)
-				if err != nil {
-					log.Printf("Failed to dial upstream: %v", err)
-					return
-				}
-				defer t.Close()
-				go func() {
-					if _, err := io.Copy(t, c); err != nil {
-						log.Printf("Error copying from client to upstream: %v", err)
-					}
-				}()
-				if _, err := io.Copy(c, t); err != nil {
-					log.Printf("Error copying from upstream to client: %v", err)
-				}
-			}(conn)
-		}
-	}()
-}
 
 func main() {
-	rand.Seed(time.Now().UnixNano())
+	if err := run(); err != nil {
+		log.Printf("microproxy exited with error: %v", err)
+		os.Exit(1)
+	}
+}
 
-	configPath := "config.yaml"
-	initialCfg, err := config.LoadConfig(configPath)
+func run() error {
+	configPath := flag.String("config", "", "path to configuration file (.yaml, .yml, .json)")
+	healthAddr := flag.String("health-addr", ":9090", "control-plane health server listen address")
+	flag.Parse()
+
+	cfg, err := config.LoadConfig(*configPath)
 	if err != nil {
-		log.Fatalf("Failed to load configuration: %v", err)
+		return fmt.Errorf("load config: %w", err)
 	}
-	cfg = initialCfg
 
-	proxyManager := NewProxyManager(cfg.UpstreamProxy.Proxies)
-	handleSignals(func() { reloadConfig(configPath, proxyManager) })
-	startSOCKS5Listener(cfg.MicroProxy.SOCKS5Proto, proxyManager)
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
 
-	proxy := goproxy.NewProxyHttpServer()
-	proxy.Verbose = true
+	dataplaneManager := dataplane.NoopListenerManager{}
+	observabilityManager := observability.NoopListenerManager{}
 
-	proxy.OnRequest().DoFunc(func(r *http.Request, ctx *goproxy.ProxyCtx) (*http.Request, *http.Response) {
-		atomic.AddInt64(&reqCount, 1)
-
-		upstream := proxyManager.GetNextProxy()
-		proxyURL, err := url.Parse(upstream)
-		if err != nil {
-			return r, goproxy.NewResponse(r, goproxy.ContentTypeText, http.StatusBadGateway, "Invalid proxy")
-		}
-		ctx.RoundTripper = CustomRoundTripper(&http.Transport{Proxy: http.ProxyURL(proxyURL)})
-
-		ipStr, _, _ := net.SplitHostPort(r.RemoteAddr)
-		clientIP := net.ParseIP(ipStr)
-		username, password := cfg.UpstreamProxy.GetCredentialsFor(clientIP)
-		if username != "" && password != "" {
-			auth := base64.StdEncoding.EncodeToString([]byte(fmt.Sprintf("%s:%s", username, password)))
-			r.Header.Set("Proxy-Authorization", "Basic "+auth)
-		}
-		return r, nil
-	})
-
-	proxy.OnResponse().DoFunc(func(resp *http.Response, ctx *goproxy.ProxyCtx) *http.Response {
-		atomic.AddInt64(&respCount, 1)
-		return resp
-	})
-
-	proxy.OnRequest(goproxy.ReqHostMatches(regexp.MustCompile(".*"))).
-		HandleConnect(goproxy.FuncHttpsHandler(func(host string, ctx *goproxy.ProxyCtx) (*goproxy.ConnectAction, string) {
-			return goproxy.OkConnect, host
-		}))
-
-	addr := cfg.MicroProxy.HTTPProto
-	if addr == "" {
-		addr = ":8080"
+	if err := dataplaneManager.Start(ctx); err != nil {
+		return fmt.Errorf("start dataplane manager: %w", err)
 	}
-	log.Printf("HTTP proxy listening on %s", addr)
+	if err := observabilityManager.Start(ctx); err != nil {
+		return fmt.Errorf("start observability manager: %w", err)
+	}
 
-	http.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
-		fmt.Fprintf(w, "requests_total %d\nresponses_total %d\n", reqCount, respCount)
-	})
+	healthServer := newHealthServer(*healthAddr)
+	healthErrCh := make(chan error, 1)
 	go func() {
-		if err := http.ListenAndServe(":9091", nil); err != nil {
-			log.Printf("Metrics server error: %v", err)
+		if err := healthServer.ListenAndServe(); !errors.Is(err, http.ErrServerClosed) {
+			healthErrCh <- err
+			return
 		}
+		healthErrCh <- nil
 	}()
 
-	server := &http.Server{
-		Addr:         addr,
-		Handler:      proxy,
-		ReadTimeout:  15 * time.Second,
-		WriteTimeout: 15 * time.Second,
+	log.Printf("microproxy bootstrap complete (http=%q https=%q socks5=%q health=%q)", cfg.MicroProxy.HTTPProto, cfg.MicroProxy.HTTPSProto, cfg.MicroProxy.SOCKS5Proto, *healthAddr)
+
+	select {
+	case err := <-healthErrCh:
+		if err != nil {
+			return fmt.Errorf("health server failed: %w", err)
+		}
+	case <-ctx.Done():
 	}
-	if err := server.ListenAndServe(); err != nil {
-		log.Fatalf("Server error: %v", err)
+
+	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	if err := healthServer.Shutdown(shutdownCtx); err != nil {
+		return fmt.Errorf("shutdown health server: %w", err)
+	}
+	if err := observabilityManager.Shutdown(shutdownCtx); err != nil {
+		return fmt.Errorf("shutdown observability manager: %w", err)
+	}
+	if err := dataplaneManager.Shutdown(shutdownCtx); err != nil {
+		return fmt.Errorf("shutdown dataplane manager: %w", err)
+	}
+
+	return nil
+}
+
+func newHealthServer(addr string) *http.Server {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte("ok"))
+	})
+
+	return &http.Server{
+		Addr:              addr,
+		Handler:           mux,
+		ReadHeaderTimeout: 5 * time.Second,
 	}
 }
