@@ -10,12 +10,12 @@ MicroProxy is a multi-vendor, downstream proxy node designed for the CROWler. It
 
 ## Installation
 
-To install MicroProxy, follow these steps:
+To install and build MicroProxy, follow these steps:
 
 ```bash
-git clone https://github.com/your-repo/microproxy.git
+git clone https://github.com/pzaino/microproxy.git
 cd microproxy
-go build
+go build -o microproxy ./cmd/microproxy
 ```
 
 ## Usage
@@ -25,6 +25,11 @@ Run the MicroProxy server with the following command:
 ```bash
 ./microproxy
 ```
+
+You can pass the optional flags below:
+
+- `-config`: path to a configuration file (`.yaml`, `.yml`, or `.json`).
+- `-health-addr`: control-plane health server listen address (default `:9090`).
 
 ## Contributing
 
