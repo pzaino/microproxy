@@ -20,6 +20,7 @@ const (
 const (
 	controlPlaneAPIKeysEnv = "MICROPROXY_CONTROLPLANE_API_KEYS"
 	controlPlaneJWTsEnv    = "MICROPROXY_CONTROLPLANE_JWTS"
+	developmentModeEnv     = "MICROPROXY_DEVELOPMENT_MODE"
 	defaultControlAPIKey   = "microproxy-controlplane-dev-key"
 )
 
@@ -90,25 +91,30 @@ func loggingMiddleware(next http.Handler) http.Handler {
 	})
 }
 
-func authMiddleware(next http.Handler) http.Handler {
-	authenticator := newAuthenticator()
-	return http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
-		if req.URL.Path == "/api/v1/health" {
-			next.ServeHTTP(rw, req)
-			return
-		}
-		if !strings.HasPrefix(req.URL.Path, "/api/v1/") {
-			next.ServeHTTP(rw, req)
-			return
-		}
+func newAuthMiddleware() (func(http.Handler) http.Handler, error) {
+	authenticator, err := newAuthenticator()
+	if err != nil {
+		return nil, err
+	}
+	return func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+			if req.URL.Path == "/api/v1/health" {
+				next.ServeHTTP(rw, req)
+				return
+			}
+			if !strings.HasPrefix(req.URL.Path, "/api/v1/") {
+				next.ServeHTTP(rw, req)
+				return
+			}
 
-		allowed, status, code, message := authenticator.authorize(req)
-		if !allowed {
-			writeError(rw, status, code, message, requestIDFromRequest(req))
-			return
-		}
-		next.ServeHTTP(rw, req)
-	})
+			allowed, status, code, message := authenticator.authorize(req)
+			if !allowed {
+				writeError(rw, status, code, message, requestIDFromRequest(req))
+				return
+			}
+			next.ServeHTTP(rw, req)
+		})
+	}, nil
 }
 
 type requestAuthenticator struct {
@@ -116,16 +122,28 @@ type requestAuthenticator struct {
 	jwts    map[string]struct{}
 }
 
-func newAuthenticator() requestAuthenticator {
+func newAuthenticator() (requestAuthenticator, error) {
 	apiKeys := parseCredentialSet(os.Getenv(controlPlaneAPIKeysEnv))
-	if len(apiKeys) == 0 {
+	jwts := parseCredentialSet(os.Getenv(controlPlaneJWTsEnv))
+	developmentMode := parseDevelopmentMode(os.Getenv(developmentModeEnv))
+
+	if len(apiKeys) == 0 && len(jwts) == 0 && !developmentMode {
+		return requestAuthenticator{}, fmt.Errorf(
+			"invalid control-plane auth configuration: set %s or %s (or explicitly enable %s for development only)",
+			controlPlaneAPIKeysEnv,
+			controlPlaneJWTsEnv,
+			developmentModeEnv,
+		)
+	}
+
+	if len(apiKeys) == 0 && developmentMode {
 		apiKeys[defaultControlAPIKey] = struct{}{}
 	}
 
 	return requestAuthenticator{
 		apiKeys: apiKeys,
-		jwts:    parseCredentialSet(os.Getenv(controlPlaneJWTsEnv)),
-	}
+		jwts:    jwts,
+	}, nil
 }
 
 func parseCredentialSet(raw string) map[string]struct{} {
@@ -138,6 +156,15 @@ func parseCredentialSet(raw string) map[string]struct{} {
 		values[trimmed] = struct{}{}
 	}
 	return values
+}
+
+func parseDevelopmentMode(raw string) bool {
+	switch strings.ToLower(strings.TrimSpace(raw)) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
 }
 
 func (a requestAuthenticator) authorize(req *http.Request) (bool, int, string, string) {

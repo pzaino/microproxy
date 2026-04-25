@@ -1,6 +1,6 @@
 # MicroProxy
 
-MicroProxy is a multi-vendor, downstream proxy node designed for the CROWler. It facilitates seamless communication between various vendors and the CROWler, ensuring efficient data collection and processing.
+MicroProxy is a multi-vendor, downstream proxy node designed for the CROWler. It facilitates seamless communication between various proxy vendors and the CROWler, ensuring efficient data collection and processing.
 
 ## Features
 
@@ -37,6 +37,16 @@ Flags:
 - `-config`: path to a configuration file (`.yaml`, `.yml`, or `.json`).
 - `-health-addr`: health endpoint listen address (default `:9090`).
 
+### Control-plane authentication environment variables
+
+The control-plane API requires explicit authentication configuration unless development mode is deliberately enabled.
+
+- `MICROPROXY_CONTROLPLANE_API_KEYS`: Comma-separated API keys accepted through `X-API-Key`.
+- `MICROPROXY_CONTROLPLANE_JWTS`: Comma-separated bearer tokens accepted through `Authorization: Bearer <token>`.
+- `MICROPROXY_DEVELOPMENT_MODE`: Optional boolean (`true|false`, `1|0`, `yes|no`, `on|off`).  
+  When `true`, and no API keys are provided, MicroProxy enables a development-only default key: `microproxy-controlplane-dev-key`.
+
+Production deployments should keep `MICROPROXY_DEVELOPMENT_MODE=false` and set at least one value in either `MICROPROXY_CONTROLPLANE_API_KEYS` or `MICROPROXY_CONTROLPLANE_JWTS`.
 
 ## Production readiness
 

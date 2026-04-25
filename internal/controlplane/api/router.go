@@ -7,6 +7,14 @@ import (
 )
 
 func NewRouter(cfg *config.Config) http.Handler {
+	handler, err := NewRouterWithError(cfg)
+	if err != nil {
+		panic(err)
+	}
+	return handler
+}
+
+func NewRouterWithError(cfg *config.Config) (http.Handler, error) {
 	handlers := NewHandlers(cfg)
 	mux := http.NewServeMux()
 
@@ -33,10 +41,15 @@ func NewRouter(cfg *config.Config) http.Handler {
 	mux.HandleFunc("GET /api/v1/sessions", handlers.StubCollection("sessions"))
 	mux.HandleFunc("GET /api/v1/sessions/{sessionID}", handlers.StubItem("sessions", "sessionID"))
 
+	authMiddleware, err := newAuthMiddleware()
+	if err != nil {
+		return nil, err
+	}
+
 	return chain(mux,
 		panicRecoveryMiddleware,
 		requestIDMiddleware,
 		authMiddleware,
 		loggingMiddleware,
-	)
+	), nil
 }

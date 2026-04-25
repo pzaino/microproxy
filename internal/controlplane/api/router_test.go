@@ -14,8 +14,16 @@ func withDefaultAuth(req *http.Request) {
 	req.Header.Set(apiKeyHeader, defaultControlAPIKey)
 }
 
+func newTestRouter(t *testing.T, cfg *config.Config) http.Handler {
+	t.Helper()
+	t.Setenv(controlPlaneAPIKeysEnv, defaultControlAPIKey)
+	t.Setenv(controlPlaneJWTsEnv, "")
+	t.Setenv(developmentModeEnv, "false")
+	return NewRouter(cfg)
+}
+
 func TestHealthEndpoint(t *testing.T) {
-	h := NewRouter(config.NewConfig())
+	h := newTestRouter(t, config.NewConfig())
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/health", nil)
 	rw := httptest.NewRecorder()
 
@@ -55,7 +63,7 @@ func TestConfigEndpoint(t *testing.T) {
 			},
 		},
 	}
-	h := NewRouter(cfg)
+	h := newTestRouter(t, cfg)
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/config", nil)
 	withDefaultAuth(req)
 	rw := httptest.NewRecorder()
@@ -98,7 +106,7 @@ func TestConfigEndpoint(t *testing.T) {
 }
 
 func TestProviderItemEndpointStub(t *testing.T) {
-	h := NewRouter(config.NewConfig())
+	h := newTestRouter(t, config.NewConfig())
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/providers/demo", nil)
 	withDefaultAuth(req)
 	rw := httptest.NewRecorder()
@@ -122,7 +130,7 @@ func TestProviderItemEndpointStub(t *testing.T) {
 }
 
 func TestAPIRouteUnauthorized(t *testing.T) {
-	h := NewRouter(config.NewConfig())
+	h := newTestRouter(t, config.NewConfig())
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/config", nil)
 	rw := httptest.NewRecorder()
 
@@ -141,7 +149,7 @@ func TestAPIRouteUnauthorized(t *testing.T) {
 }
 
 func TestAPIRouteForbidden(t *testing.T) {
-	h := NewRouter(config.NewConfig())
+	h := newTestRouter(t, config.NewConfig())
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/config", nil)
 	req.Header.Set(apiKeyHeader, "wrong-key")
 	rw := httptest.NewRecorder()
@@ -161,13 +169,46 @@ func TestAPIRouteForbidden(t *testing.T) {
 }
 
 func TestAPIRouteAuthorized(t *testing.T) {
-	h := NewRouter(config.NewConfig())
+	h := newTestRouter(t, config.NewConfig())
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/config", nil)
 	withDefaultAuth(req)
 	rw := httptest.NewRecorder()
 
 	h.ServeHTTP(rw, req)
 
+	if rw.Code != http.StatusOK {
+		t.Fatalf("expected 200 got %d", rw.Code)
+	}
+}
+
+func TestNewRouterWithErrorWithoutCredentials(t *testing.T) {
+	t.Setenv(controlPlaneAPIKeysEnv, "")
+	t.Setenv(controlPlaneJWTsEnv, "")
+	t.Setenv(developmentModeEnv, "false")
+
+	_, err := NewRouterWithError(config.NewConfig())
+	if err == nil {
+		t.Fatalf("expected configuration error")
+	}
+	if !strings.Contains(err.Error(), controlPlaneAPIKeysEnv) {
+		t.Fatalf("expected error to reference %s, got %v", controlPlaneAPIKeysEnv, err)
+	}
+}
+
+func TestNewRouterWithErrorDevelopmentModeAllowsDefaultKey(t *testing.T) {
+	t.Setenv(controlPlaneAPIKeysEnv, "")
+	t.Setenv(controlPlaneJWTsEnv, "")
+	t.Setenv(developmentModeEnv, "true")
+
+	h, err := NewRouterWithError(config.NewConfig())
+	if err != nil {
+		t.Fatalf("expected development mode to allow default key, got %v", err)
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/config", nil)
+	req.Header.Set(apiKeyHeader, defaultControlAPIKey)
+	rw := httptest.NewRecorder()
+	h.ServeHTTP(rw, req)
 	if rw.Code != http.StatusOK {
 		t.Fatalf("expected 200 got %d", rw.Code)
 	}

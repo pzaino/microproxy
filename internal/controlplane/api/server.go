@@ -13,9 +13,14 @@ import (
 const defaultShutdownTimeout = 10 * time.Second
 
 func Serve(ctx context.Context, addr string, cfg *config.Config) error {
+	router, err := NewRouterWithError(cfg)
+	if err != nil {
+		return fmt.Errorf("configure control-plane server: %w", err)
+	}
+
 	server := &http.Server{
 		Addr:    addr,
-		Handler: NewRouter(cfg),
+		Handler: router,
 	}
 
 	errCh := make(chan error, 1)
