@@ -105,7 +105,7 @@ func TestConfigEndpoint(t *testing.T) {
 	}
 }
 
-func TestProviderItemEndpointStub(t *testing.T) {
+func TestProviderItemEndpointNotFound(t *testing.T) {
 	h := newTestRouter(t, config.NewConfig())
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/providers/demo", nil)
 	withDefaultAuth(req)
@@ -113,15 +113,15 @@ func TestProviderItemEndpointStub(t *testing.T) {
 
 	h.ServeHTTP(rw, req)
 
-	if rw.Code != http.StatusNotImplemented {
-		t.Fatalf("expected 501 got %d", rw.Code)
+	if rw.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 got %d", rw.Code)
 	}
 
 	var body ErrorEnvelope
 	if err := json.Unmarshal(rw.Body.Bytes(), &body); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
-	if body.Error.Code != "not_implemented" {
+	if body.Error.Code != "not_found" {
 		t.Fatalf("unexpected error code: %s", body.Error.Code)
 	}
 	if body.Error.RequestID == "" {

@@ -37,6 +37,37 @@ type StubListResponse struct {
 	Items    []any  `json:"items"`
 }
 
+type Provider struct {
+	ID              string       `json:"id"`
+	ResourceVersion string       `json:"resourceVersion"`
+	Spec            ProviderSpec `json:"spec"`
+}
+
+type ProviderSpec struct {
+	ID       string `json:"id,omitempty"`
+	Name     string `json:"name"`
+	Type     string `json:"type"`
+	Endpoint string `json:"endpoint"`
+}
+
+type ProviderWriteRequest struct {
+	ResourceVersion string       `json:"resourceVersion,omitempty"`
+	Provider        ProviderSpec `json:"provider"`
+}
+
+type ProviderPatchRequest struct {
+	ResourceVersion string         `json:"resourceVersion,omitempty"`
+	Patch           map[string]any `json:"patch"`
+}
+
+type ProviderResponse struct {
+	Provider Provider `json:"provider"`
+}
+
+type ProviderListResponse struct {
+	Items []Provider `json:"items"`
+}
+
 const redactedSecretValue = "[REDACTED]"
 
 // NewSanitizedConfigView returns a copy of cfg with secrets masked.

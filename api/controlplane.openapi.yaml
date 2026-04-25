@@ -2,7 +2,7 @@ openapi: 3.1.0
 info:
   title: MicroProxy Control Plane API
   version: 0.1.0
-  description: Initial contract for MicroProxy control-plane resources.
+  description: Control-plane contract for MicroProxy resources.
 servers:
   - url: http://localhost:8081
 paths:
@@ -31,58 +31,64 @@ paths:
                 $ref: '#/components/schemas/ConfigResponse'
   /api/v1/providers:
     get:
-      summary: List providers (stub)
+      summary: List providers
       operationId: listProviders
       responses:
         '200':
-          description: Stubbed providers resource.
+          description: Provider collection.
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/StubListResponse'
+                $ref: '#/components/schemas/ProviderListResponse'
     post:
-      summary: Create provider (stub)
+      summary: Create provider
       operationId: createProvider
       requestBody:
         required: true
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/ProviderCreateRequest'
+              $ref: '#/components/schemas/ProviderWriteRequest'
       responses:
-        '400':
-          description: Request validation failed.
+        '201':
+          description: Provider created.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProviderResponse'
+        '409':
+          description: Provider ID already exists.
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorEnvelope'
-        '405':
-          description: Method not allowed.
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorEnvelope'
-        '501':
-          description: Not implemented yet.
+        '422':
+          description: Semantic validation failed.
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorEnvelope'
   /api/v1/providers/{providerID}:
     get:
-      summary: Get provider (stub)
+      summary: Get provider
       operationId: getProvider
       parameters:
         - $ref: '#/components/parameters/providerID'
       responses:
-        '501':
-          description: Not implemented yet.
+        '200':
+          description: Provider resource.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProviderResponse'
+        '404':
+          description: Provider not found.
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorEnvelope'
     put:
-      summary: Replace provider (stub)
+      summary: Replace provider
       operationId: replaceProvider
       parameters:
         - $ref: '#/components/parameters/providerID'
@@ -91,76 +97,96 @@ paths:
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/ProviderReplaceRequest'
+              $ref: '#/components/schemas/ProviderWriteRequest'
       responses:
-        '400':
-          description: Request validation failed.
+        '200':
+          description: Provider replaced.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProviderResponse'
+        '404':
+          description: Provider not found.
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorEnvelope'
-        '405':
-          description: Method not allowed.
+        '409':
+          description: Resource version conflict.
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorEnvelope'
-        '501':
-          description: Not implemented yet.
+        '422':
+          description: Semantic validation failed.
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorEnvelope'
     patch:
-      summary: Patch provider (stub)
+      summary: Patch provider
       operationId: patchProvider
       parameters:
         - $ref: '#/components/parameters/providerID'
       requestBody:
-        required: false
+        required: true
         content:
           application/json:
             schema:
               $ref: '#/components/schemas/ProviderPatchRequest'
       responses:
-        '400':
-          description: Request validation failed.
+        '200':
+          description: Provider patched.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProviderResponse'
+        '404':
+          description: Provider not found.
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorEnvelope'
-        '405':
-          description: Method not allowed.
+        '409':
+          description: Resource version conflict.
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorEnvelope'
-        '501':
-          description: Not implemented yet.
+        '422':
+          description: Semantic validation failed.
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorEnvelope'
     delete:
-      summary: Delete provider (stub)
+      summary: Delete provider
       operationId: deleteProvider
       parameters:
         - $ref: '#/components/parameters/providerID'
+        - name: resourceVersion
+          in: query
+          required: false
+          schema:
+            type: string
+          description: Expected resource version. Can also be supplied in `If-Match` header.
       responses:
-        '400':
-          description: Request validation failed.
+        '204':
+          description: Provider deleted.
+        '404':
+          description: Provider not found.
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorEnvelope'
-        '405':
-          description: Method not allowed.
+        '409':
+          description: Resource version conflict.
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorEnvelope'
-        '501':
-          description: Not implemented yet.
+        '422':
+          description: Semantic validation failed.
           content:
             application/json:
               schema:
@@ -326,56 +352,68 @@ components:
           items:
             type: object
             additionalProperties: true
-    ProviderCreateRequest:
+    ProviderSpec:
       type: object
-      description: Minimal provider create contract accepted by current stub.
-      minProperties: 1
-      additionalProperties: true
+      required: [id, name, type, endpoint]
       properties:
+        id:
+          type: string
         name:
           type: string
-          description: Provider display name.
         type:
           type: string
-          description: Provider implementation type.
         endpoint:
           type: string
-          description: Provider base endpoint URL.
-    ProviderReplaceRequest:
+    Provider:
       type: object
-      description: Minimal provider replace contract accepted by current stub.
-      minProperties: 1
-      additionalProperties: true
+      required: [id, resourceVersion, spec]
       properties:
-        name:
+        id:
           type: string
-          description: Provider display name.
-        type:
+        resourceVersion:
           type: string
-          description: Provider implementation type.
-        endpoint:
+        spec:
+          $ref: '#/components/schemas/ProviderSpec'
+    ProviderWriteRequest:
+      type: object
+      required: [provider]
+      properties:
+        resourceVersion:
           type: string
-          description: Provider base endpoint URL.
-        enabled:
-          type: boolean
-          description: Whether the provider is enabled.
+          description: Required for PUT and ignored for POST.
+        provider:
+          $ref: '#/components/schemas/ProviderSpec'
     ProviderPatchRequest:
       type: object
-      description: Minimal provider patch contract accepted by current stub. Empty object is allowed.
-      additionalProperties: true
+      required: [resourceVersion, patch]
       properties:
-        name:
+        resourceVersion:
           type: string
-          description: Provider display name.
-        type:
-          type: string
-          description: Provider implementation type.
-        endpoint:
-          type: string
-          description: Provider base endpoint URL.
-        enabled:
-          type: boolean
-          description: Whether the provider is enabled.
+        patch:
+          type: object
+          minProperties: 1
+          additionalProperties: false
+          properties:
+            name:
+              type: string
+            type:
+              type: string
+            endpoint:
+              type: string
+    ProviderResponse:
+      type: object
+      required: [provider]
+      properties:
+        provider:
+          $ref: '#/components/schemas/Provider'
+    ProviderListResponse:
+      type: object
+      required: [items]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/Provider'
     ErrorEnvelope:
       type: object
       required: [error]
@@ -388,7 +426,7 @@ components:
       properties:
         code:
           type: string
-          example: not_implemented
+          example: validation_failed
         message:
           type: string
         request_id:
