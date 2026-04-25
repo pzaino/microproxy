@@ -50,6 +50,8 @@ type ListenerConfig struct {
 	TLS       *TLSConfig `json:"tls,omitempty" yaml:"tls,omitempty"`
 	RateLimit int        `json:"rate_limit,omitempty" yaml:"rate_limit,omitempty"`
 	AuthType  string     `json:"auth_type,omitempty" yaml:"auth_type,omitempty"`
+	Username  string     `json:"username,omitempty" yaml:"username,omitempty"`
+	Password  string     `json:"password,omitempty" yaml:"password,omitempty"`
 	Enabled   bool       `json:"enabled" yaml:"enabled"`
 }
 
@@ -485,6 +487,19 @@ func (l ListenerConfig) Validate(fieldPath string) *ValidationErrors {
 		}
 	} else if l.TLS != nil {
 		errs.Add(fieldPath+".tls", "must only be set for https listeners")
+	}
+
+	switch strings.ToLower(strings.TrimSpace(l.AuthType)) {
+	case "", "none":
+	case "basic":
+		if strings.TrimSpace(l.Username) == "" {
+			errs.Add(fieldPath+".username", "is required for basic auth")
+		}
+		if strings.TrimSpace(l.Password) == "" {
+			errs.Add(fieldPath+".password", "is required for basic auth")
+		}
+	default:
+		errs.Add(fieldPath+".auth_type", "must be one of: none, basic")
 	}
 
 	return errs

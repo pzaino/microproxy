@@ -29,6 +29,46 @@ func (NoopListenerManager) Start(context.Context) error { return nil }
 
 func (NoopListenerManager) Shutdown(context.Context) error { return nil }
 
+// CompositeListenerManager starts/stops a set of concrete listener managers.
+type CompositeListenerManager struct {
+	managers []ListenerManager
+}
+
+func NewCompositeListenerManager(managers ...ListenerManager) *CompositeListenerManager {
+	active := make([]ListenerManager, 0, len(managers))
+	for _, manager := range managers {
+		if manager == nil {
+			continue
+		}
+		active = append(active, manager)
+	}
+	return &CompositeListenerManager{managers: active}
+}
+
+func (m *CompositeListenerManager) Start(ctx context.Context) error {
+	started := make([]ListenerManager, 0, len(m.managers))
+	for _, manager := range m.managers {
+		if err := manager.Start(ctx); err != nil {
+			for i := len(started) - 1; i >= 0; i-- {
+				_ = started[i].Shutdown(ctx)
+			}
+			return err
+		}
+		started = append(started, manager)
+	}
+	return nil
+}
+
+func (m *CompositeListenerManager) Shutdown(ctx context.Context) error {
+	var errs []error
+	for i := len(m.managers) - 1; i >= 0; i-- {
+		if err := m.managers[i].Shutdown(ctx); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
+}
+
 // HTTPListenerManager owns one or more HTTP(S) data-plane listeners.
 type HTTPListenerManager struct {
 	drainTimeout time.Duration
@@ -48,27 +88,38 @@ type serverState struct {
 	conns  map[net.Conn]struct{}
 }
 
-// NewListenerManager wires the runtime to a concrete listener manager.
-// It keeps NoopListenerManager as a fallback when no enabled HTTP listeners exist.
+// NewListenerManager wires the runtime to concrete listener managers.
 func NewListenerManager(cfg *config.Config) ListenerManager {
 	if cfg == nil {
 		return NoopListenerManager{}
 	}
 
 	httpListeners := make([]config.ListenerConfig, 0, len(cfg.Listeners))
+	socks5Listeners := make([]config.ListenerConfig, 0, len(cfg.Listeners))
 	for _, listenerCfg := range cfg.Listeners {
 		if !listenerCfg.Enabled {
 			continue
 		}
-		if listenerCfg.Type == "http" || listenerCfg.Type == "https" {
+		switch listenerCfg.Type {
+		case "http", "https":
 			httpListeners = append(httpListeners, listenerCfg)
+		case "socks5":
+			socks5Listeners = append(socks5Listeners, listenerCfg)
 		}
 	}
-	if len(httpListeners) == 0 {
+
+	managers := make([]ListenerManager, 0, 2)
+	runtime := NewRequestRuntime(cfg)
+	if len(httpListeners) > 0 {
+		managers = append(managers, NewHTTPListenerManager(httpListeners, defaultDrainTimeout, cfg.Observability.AccessLog.Enabled, runtime))
+	}
+	if len(socks5Listeners) > 0 {
+		managers = append(managers, NewSOCKS5ListenerManager(socks5Listeners, defaultDrainTimeout, runtime))
+	}
+	if len(managers) == 0 {
 		return NoopListenerManager{}
 	}
-
-	return NewHTTPListenerManager(httpListeners, defaultDrainTimeout, cfg.Observability.AccessLog.Enabled, NewRequestRuntime(cfg))
+	return NewCompositeListenerManager(managers...)
 }
 
 func NewHTTPListenerManager(listenerConfigs []config.ListenerConfig, drainTimeout time.Duration, accessLogEnabled bool, runtime listeners.RequestRuntime) *HTTPListenerManager {

@@ -16,35 +16,34 @@ func TestNewListenerManager_FallbackToNoop(t *testing.T) {
 		t.Fatalf("expected NoopListenerManager, got %T", mgr)
 	}
 
-	cfg := &config.Config{
-		Listeners: []config.ListenerConfig{{Name: "socks", Type: "socks5", Address: ":1080", Enabled: true}},
-	}
-	mgr = NewListenerManager(cfg)
-	if _, ok := mgr.(NoopListenerManager); !ok {
-		t.Fatalf("expected NoopListenerManager for non-http listeners, got %T", mgr)
-	}
 }
 
-func TestNewListenerManager_ConcreteForHTTP(t *testing.T) {
+func TestNewListenerManager_CompositeForEnabledListeners(t *testing.T) {
 	t.Parallel()
 
 	cfg := &config.Config{
-		Listeners: []config.ListenerConfig{{Name: "http", Type: "http", Address: "127.0.0.1:0", Enabled: true}},
+		Listeners: []config.ListenerConfig{
+			{Name: "http", Type: "http", Address: "127.0.0.1:0", Enabled: true},
+			{Name: "socks", Type: "socks5", Address: "127.0.0.1:0", Enabled: true},
+		},
 	}
 
 	mgr := NewListenerManager(cfg)
-	httpMgr, ok := mgr.(*HTTPListenerManager)
+	composite, ok := mgr.(*CompositeListenerManager)
 	if !ok {
-		t.Fatalf("expected *HTTPListenerManager, got %T", mgr)
+		t.Fatalf("expected *CompositeListenerManager, got %T", mgr)
+	}
+	if len(composite.managers) != 2 {
+		t.Fatalf("expected 2 managers, got %d", len(composite.managers))
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 
-	if err := httpMgr.Start(ctx); err != nil {
+	if err := composite.Start(ctx); err != nil {
 		t.Fatalf("start failed: %v", err)
 	}
-	if err := httpMgr.Shutdown(ctx); err != nil {
+	if err := composite.Shutdown(ctx); err != nil {
 		t.Fatalf("shutdown failed: %v", err)
 	}
 }
