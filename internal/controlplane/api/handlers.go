@@ -5,10 +5,13 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"time"
 
 	"github.com/pzaino/microproxy/internal/dataplane"
+	"github.com/pzaino/microproxy/internal/dataplane/listeners"
+	"github.com/pzaino/microproxy/internal/dataplane/policy"
 	"github.com/pzaino/microproxy/pkg/config"
 )
 
@@ -290,6 +293,48 @@ func (h *Handlers) DeleteProvider(rw http.ResponseWriter, req *http.Request) {
 		return
 	}
 	writeNoContent(rw)
+}
+
+func (h *Handlers) PolicyDryRun(rw http.ResponseWriter, req *http.Request) {
+	if req.Method != http.MethodPost {
+		writeError(rw, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed", requestIDFromRequest(req))
+		return
+	}
+	var payload PolicyDryRunRequest
+	if err := decodeJSONBody(req, &payload); err != nil {
+		writeError(rw, http.StatusBadRequest, "invalid_request", err.Error(), requestIDFromRequest(req))
+		return
+	}
+	if strings.TrimSpace(payload.PolicyRef) == "" {
+		writeError(rw, http.StatusUnprocessableEntity, "validation_failed", "policyRef is required", requestIDFromRequest(req))
+		return
+	}
+	sampleURL := strings.TrimSpace(payload.URL)
+	if sampleURL == "" {
+		sampleURL = "http://example.local/"
+	}
+	method := strings.TrimSpace(payload.Method)
+	if method == "" {
+		method = http.MethodGet
+	}
+	sampleReq := httptest.NewRequest(method, sampleURL, nil)
+	for k, v := range payload.Headers {
+		sampleReq.Header.Set(k, v)
+	}
+	engine := policy.NewEngine(h.cfg)
+	decision := engine.Evaluate(sampleReq, listeners.RequestMetadata{
+		TenantID:        payload.Metadata.TenantID,
+		Provider:        payload.Metadata.Provider,
+		ContentType:     payload.Metadata.ContentType,
+		RequestSize:     payload.Metadata.RequestSize,
+		ResponseSize:    payload.Metadata.ResponseSize,
+		EvaluationClock: payload.Metadata.EvaluationTime,
+	}, listeners.RouteDecision{
+		Provider: payload.Metadata.Provider,
+		Policy:   payload.PolicyRef,
+		TenantID: payload.Metadata.TenantID,
+	})
+	writeJSON(rw, http.StatusOK, PolicyDryRunResponse{Decision: decision})
 }
 
 func decodeProviderWriteRequest(req *http.Request) (ProviderWriteRequest, error) {

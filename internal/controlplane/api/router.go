@@ -31,6 +31,7 @@ func NewRouterWithError(cfg *config.Config) (http.Handler, error) {
 
 	mux.HandleFunc("GET /api/v1/policies", handlers.StubCollection("policies"))
 	mux.HandleFunc("GET /api/v1/policies/{policyID}", handlers.StubItem("policies", "policyID"))
+	mux.HandleFunc("POST /api/v1/policies/dry-run", handlers.PolicyDryRun)
 
 	mux.HandleFunc("GET /api/v1/routing", handlers.StubCollection("routing"))
 	mux.HandleFunc("GET /api/v1/routing/{routeID}", handlers.StubItem("routing", "routeID"))

@@ -215,6 +215,35 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorEnvelope'
+  /api/v1/policies/dry-run:
+    post:
+      summary: Dry-run policy evaluation
+      operationId: policyDryRun
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PolicyDryRunRequest'
+      responses:
+        '200':
+          description: Policy dry-run evaluation result.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PolicyDryRunResponse'
+        '400':
+          description: Invalid payload.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '422':
+          description: Semantic validation failed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
   /api/v1/routing:
     get:
       summary: List routing rules (stub)
@@ -414,6 +443,44 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/Provider'
+    PolicyDryRunRequest:
+      type: object
+      required: [policyRef]
+      properties:
+        policyRef:
+          type: string
+        method:
+          type: string
+        url:
+          type: string
+        headers:
+          type: object
+          additionalProperties:
+            type: string
+        metadata:
+          type: object
+          properties:
+            tenantID:
+              type: string
+            provider:
+              type: string
+            contentType:
+              type: string
+            requestSize:
+              type: integer
+              format: int64
+            responseSize:
+              type: integer
+              format: int64
+            evaluationTime:
+              type: string
+              format: date-time
+    PolicyDryRunResponse:
+      type: object
+      properties:
+        decision:
+          type: object
+          additionalProperties: true
     ErrorEnvelope:
       type: object
       required: [error]

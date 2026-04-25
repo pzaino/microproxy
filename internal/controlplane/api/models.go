@@ -4,6 +4,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/pzaino/microproxy/internal/dataplane/listeners"
 	"github.com/pzaino/microproxy/pkg/config"
 )
 
@@ -86,6 +87,27 @@ type ProviderResponse struct {
 
 type ProviderListResponse struct {
 	Items []Provider `json:"items"`
+}
+
+type PolicyDryRunRequest struct {
+	PolicyRef string                  `json:"policyRef"`
+	Method    string                  `json:"method,omitempty"`
+	URL       string                  `json:"url,omitempty"`
+	Headers   map[string]string       `json:"headers,omitempty"`
+	Metadata  PolicyDryRunRequestMeta `json:"metadata,omitempty"`
+}
+
+type PolicyDryRunRequestMeta struct {
+	TenantID       string    `json:"tenantID,omitempty"`
+	Provider       string    `json:"provider,omitempty"`
+	ContentType    string    `json:"contentType,omitempty"`
+	RequestSize    int64     `json:"requestSize,omitempty"`
+	ResponseSize   int64     `json:"responseSize,omitempty"`
+	EvaluationTime time.Time `json:"evaluationTime,omitempty"`
+}
+
+type PolicyDryRunResponse struct {
+	Decision listeners.PolicyDecision `json:"decision"`
 }
 
 const redactedSecretValue = "[REDACTED]"

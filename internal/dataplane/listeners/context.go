@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"net/http"
+	"time"
 )
 
 type contextKey string
@@ -13,12 +14,18 @@ const metadataContextKey contextKey = "request-metadata"
 
 // RequestMetadata carries per-request values for future routing/observability.
 type RequestMetadata struct {
-	RequestID    string
-	TenantID     string
-	Provider     string
-	Policy       string
-	PolicyAction string
-	PolicyReason string
+	RequestID       string
+	TenantID        string
+	Provider        string
+	Policy          string
+	PolicyAction    string
+	PolicyReason    string
+	PolicyCategory  string
+	PolicyTrace     []string
+	ContentType     string
+	RequestSize     int64
+	ResponseSize    int64
+	EvaluationClock time.Time
 }
 
 type metadataRef struct {

@@ -9,7 +9,10 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
+	"strconv"
 	"strings"
+	"time"
 
 	"gopkg.in/yaml.v2"
 )
@@ -34,6 +37,7 @@ type Config struct {
 	Providers     []ProviderConfig    `json:"providers" yaml:"providers"`
 	Routing       RoutingConfig       `json:"routing" yaml:"routing"`
 	Policies      []PolicyConfig      `json:"policies" yaml:"policies"`
+	PolicyEngine  PolicyEngineConfig  `json:"policy_engine,omitempty" yaml:"policy_engine,omitempty"`
 	Tenants       []TenantConfig      `json:"tenants" yaml:"tenants"`
 	Observability ObservabilityConfig `json:"observability" yaml:"observability"`
 
@@ -110,6 +114,15 @@ type PolicyConfig struct {
 	Action     string            `json:"action" yaml:"action"`
 	Selectors  map[string]string `json:"selectors,omitempty" yaml:"selectors,omitempty"`
 	Parameters map[string]string `json:"parameters,omitempty" yaml:"parameters,omitempty"`
+}
+
+type PolicyEngineConfig struct {
+	ChainMode string             `json:"chain_mode,omitempty" yaml:"chain_mode,omitempty"`
+	SafeMode  PolicySafeModeFlag `json:"safe_mode,omitempty" yaml:"safe_mode,omitempty"`
+}
+
+type PolicySafeModeFlag struct {
+	AllowBodyMutation bool `json:"allow_body_mutation" yaml:"allow_body_mutation"`
 }
 
 type TenantConfig struct {
@@ -454,6 +467,7 @@ func (c *Config) Validate() error {
 	}
 
 	errs.Merge(c.Routing.Validate("routing", providerNameSeen, policyNameSeen))
+	errs.Merge(c.PolicyEngine.Validate("policy_engine"))
 	errs.Merge(c.UpstreamProxy.Validate("upstream_proxy"))
 
 	return errs.OrNil()
@@ -679,8 +693,62 @@ func (p PolicyConfig) Validate(fieldPath string) *ValidationErrors {
 			errs.Add(fieldPath+".selectors.ip_range", "must be a valid CIDR")
 		}
 	}
+	if action := strings.ToLower(strings.TrimSpace(p.Action)); action != "" {
+		switch action {
+		case "allow", "deny", "route_override", "headers_patch", "redirect", "rewrite", "response_headers_patch", "body_mutation_hook":
+		default:
+			errs.Add(fieldPath+".action", "must be one of: allow, deny, route_override, headers_patch, redirect, rewrite, response_headers_patch, body_mutation_hook")
+		}
+	}
+	for key, value := range p.Selectors {
+		selectorPath := fieldPath + ".selectors." + key
+		switch strings.ToLower(strings.TrimSpace(key)) {
+		case "url_regex", "domain_suffix_regex", "content_type_regex":
+			if _, err := regexp.Compile(value); err != nil {
+				errs.Add(selectorPath, "must be a valid regex")
+			}
+		case "request_size_min", "request_size_max", "response_size_min", "response_size_max":
+			if _, err := strconv.ParseInt(strings.TrimSpace(value), 10, 64); err != nil {
+				errs.Add(selectorPath, "must be an integer byte size")
+			}
+		case "time_window_utc":
+			if err := validateTimeWindow(strings.TrimSpace(value)); err != nil {
+				errs.Add(selectorPath, err.Error())
+			}
+		}
+	}
+	if strings.TrimSpace(p.Parameters["deny_category"]) != "" {
+		switch strings.ToLower(strings.TrimSpace(p.Parameters["deny_category"])) {
+		case "security", "compliance", "quota", "routing", "content", "other":
+		default:
+			errs.Add(fieldPath+".parameters.deny_category", "must be one of: security, compliance, quota, routing, content, other")
+		}
+	}
 
 	return errs
+}
+
+func (c PolicyEngineConfig) Validate(fieldPath string) *ValidationErrors {
+	errs := &ValidationErrors{}
+	switch strings.ToLower(strings.TrimSpace(c.ChainMode)) {
+	case "", "stop", "continue":
+	default:
+		errs.Add(fieldPath+".chain_mode", "must be one of: stop, continue")
+	}
+	return errs
+}
+
+func validateTimeWindow(value string) error {
+	parts := strings.Split(value, "-")
+	if len(parts) != 2 {
+		return fmt.Errorf("must be in HH:MM-HH:MM format")
+	}
+	for _, part := range parts {
+		if _, err := time.Parse("15:04", strings.TrimSpace(part)); err != nil {
+			return fmt.Errorf("must be in HH:MM-HH:MM format")
+		}
+	}
+	return nil
 }
 
 func (t TenantConfig) Validate(fieldPath string) *ValidationErrors {

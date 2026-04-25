@@ -79,12 +79,21 @@ type TimeoutClassifier func(error) TimeoutClassification
 
 // PolicyDecision captures policy evaluation output for a request.
 type PolicyDecision struct {
-	PolicyName    string
-	Action        string
-	DenyCode      string
-	DenyMessage   string
-	RouteOverride string
-	HeadersPatch  map[string]string
+	PolicyName           string
+	Action               string
+	DenyCode             string
+	DenyMessage          string
+	DenyCategory         string
+	RouteOverride        string
+	HeadersPatch         map[string]string
+	ResponseHeadersPatch map[string]string
+	RedirectURL          string
+	RewriteScheme        string
+	RewriteHost          string
+	RewritePathPrefix    string
+	RequestBodyPrefix    string
+	ResponseBodyPrefix   string
+	Trace                []string
 }
 
 // PolicyEvaluator resolves an action for the current request.
@@ -149,6 +158,9 @@ func (h *ForwardProxyHandler) ServeHTTP(rw http.ResponseWriter, req *http.Reques
 func (h *ForwardProxyHandler) handleForward(rw http.ResponseWriter, req *http.Request) {
 	decision, endpoints, resolved := h.resolveRoute(req)
 	metadata, _ := MetadataFromContext(req.Context())
+	metadata.ContentType = req.Header.Get("Content-Type")
+	metadata.RequestSize = req.ContentLength
+	metadata.EvaluationClock = time.Now().UTC()
 	if resolved {
 		UpdateMetadata(req.Context(), func(metadata *RequestMetadata) {
 			if decision.TenantID != "" {
@@ -161,6 +173,9 @@ func (h *ForwardProxyHandler) handleForward(rw http.ResponseWriter, req *http.Re
 	policyDecision := h.evaluatePolicy(req, metadata, decision)
 	h.recordPolicyDecision(req.Context(), policyDecision)
 	if h.applyDeny(rw, policyDecision) {
+		return
+	}
+	if h.applyRedirect(rw, policyDecision) {
 		return
 	}
 	if policyDecision.Action == "route_override" {
@@ -184,6 +199,12 @@ func (h *ForwardProxyHandler) handleForward(rw http.ResponseWriter, req *http.Re
 	if policyDecision.Action == "headers_patch" {
 		patchHeaders(outReq.Header, policyDecision.HeadersPatch)
 	}
+	if policyDecision.Action == "rewrite" {
+		applyRewrite(outReq, policyDecision)
+	}
+	if policyDecision.RequestBodyPrefix != "" && outReq.Body != nil {
+		outReq.Body = io.NopCloser(io.MultiReader(strings.NewReader(policyDecision.RequestBodyPrefix), outReq.Body))
+	}
 
 	resp, err := h.roundTripWithFallback(outReq, endpoints)
 	if err != nil {
@@ -193,8 +214,14 @@ func (h *ForwardProxyHandler) handleForward(rw http.ResponseWriter, req *http.Re
 	defer resp.Body.Close()
 
 	removeHopHeaders(resp.Header)
+	if len(policyDecision.ResponseHeadersPatch) > 0 {
+		patchHeaders(resp.Header, policyDecision.ResponseHeadersPatch)
+	}
 	copyHeader(rw.Header(), resp.Header)
 	rw.WriteHeader(resp.StatusCode)
+	if policyDecision.ResponseBodyPrefix != "" {
+		_, _ = io.WriteString(rw, policyDecision.ResponseBodyPrefix)
+	}
 	_, _ = io.Copy(rw, resp.Body)
 }
 
@@ -242,6 +269,9 @@ func (h *ForwardProxyHandler) handleConnect(rw http.ResponseWriter, req *http.Re
 
 	decision, endpoints, resolved := h.resolveRoute(req)
 	metadata, _ := MetadataFromContext(req.Context())
+	metadata.ContentType = req.Header.Get("Content-Type")
+	metadata.RequestSize = req.ContentLength
+	metadata.EvaluationClock = time.Now().UTC()
 	if resolved {
 		UpdateMetadata(req.Context(), func(metadata *RequestMetadata) {
 			if decision.TenantID != "" {
@@ -254,6 +284,9 @@ func (h *ForwardProxyHandler) handleConnect(rw http.ResponseWriter, req *http.Re
 	policyDecision := h.evaluatePolicy(req, metadata, decision)
 	h.recordPolicyDecision(req.Context(), policyDecision)
 	if h.applyDeny(rw, policyDecision) {
+		return
+	}
+	if h.applyRedirect(rw, policyDecision) {
 		return
 	}
 	if policyDecision.Action == "route_override" {
@@ -383,11 +416,21 @@ func (h *ForwardProxyHandler) applyDeny(rw http.ResponseWriter, policyDecision P
 	rw.WriteHeader(http.StatusForbidden)
 	_ = json.NewEncoder(rw).Encode(map[string]any{
 		"error": map[string]string{
-			"code":    valueOrDefault(policyDecision.DenyCode, "policy_denied"),
-			"message": valueOrDefault(policyDecision.DenyMessage, "request denied by policy"),
-			"policy":  policyDecision.PolicyName,
+			"code":     valueOrDefault(policyDecision.DenyCode, "policy_denied"),
+			"message":  valueOrDefault(policyDecision.DenyMessage, "request denied by policy"),
+			"policy":   policyDecision.PolicyName,
+			"category": valueOrDefault(policyDecision.DenyCategory, "other"),
 		},
 	})
+	return true
+}
+
+func (h *ForwardProxyHandler) applyRedirect(rw http.ResponseWriter, policyDecision PolicyDecision) bool {
+	if policyDecision.Action != "redirect" || strings.TrimSpace(policyDecision.RedirectURL) == "" {
+		return false
+	}
+	rw.Header().Set("Location", policyDecision.RedirectURL)
+	rw.WriteHeader(http.StatusFound)
 	return true
 }
 
@@ -396,7 +439,26 @@ func (h *ForwardProxyHandler) recordPolicyDecision(ctx context.Context, decision
 		metadata.Policy = decision.PolicyName
 		metadata.PolicyAction = valueOrDefault(decision.Action, "allow")
 		metadata.PolicyReason = valueOrDefault(decision.DenyCode, "none")
+		metadata.PolicyCategory = valueOrDefault(decision.DenyCategory, "none")
+		metadata.PolicyTrace = append([]string(nil), decision.Trace...)
 	})
+}
+
+func applyRewrite(req *http.Request, decision PolicyDecision) {
+	if req == nil || req.URL == nil {
+		return
+	}
+	if decision.RewriteScheme != "" {
+		req.URL.Scheme = decision.RewriteScheme
+	}
+	if decision.RewriteHost != "" {
+		req.URL.Host = decision.RewriteHost
+	}
+	if decision.RewritePathPrefix != "" {
+		path := strings.TrimPrefix(req.URL.Path, "/")
+		prefix := strings.TrimSuffix(decision.RewritePathPrefix, "/")
+		req.URL.Path = prefix + "/" + path
+	}
 }
 
 func providerFromContext(ctx context.Context) string {

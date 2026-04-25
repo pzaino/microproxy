@@ -217,6 +217,8 @@ func HTTPMiddleware(next http.Handler, accessLogEnabled bool) http.Handler {
 				"latency_ms", latency.Milliseconds(),
 				"method", req.Method,
 				"path", req.URL.Path,
+				"policy_category", valueOrDefault(resolvedMetadata.PolicyCategory, "none"),
+				"policy_trace", strings.Join(resolvedMetadata.PolicyTrace, ","),
 			)
 		}
 	})

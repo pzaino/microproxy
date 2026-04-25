@@ -16,18 +16,19 @@ import (
 var routeRegistrationPattern = regexp.MustCompile(`mux\.HandleFunc\("([A-Z]+)\s+([^\"]+)",`)
 
 var expectedControlPlaneRoutes = map[string][]string{
-	"/api/v1/health":                {"GET"},
-	"/api/v1/config":                {"GET"},
-	"/api/v1/providers":             {"GET", "POST"},
+	"/api/v1/health":                 {"GET"},
+	"/api/v1/config":                 {"GET"},
+	"/api/v1/providers":              {"GET", "POST"},
 	"/api/v1/providers/{providerID}": {"DELETE", "GET", "PATCH", "PUT"},
-	"/api/v1/policies":              {"GET"},
-	"/api/v1/policies/{policyID}":   {"GET"},
-	"/api/v1/routing":               {"GET"},
-	"/api/v1/routing/{routeID}":     {"GET"},
-	"/api/v1/tenants":               {"GET"},
-	"/api/v1/tenants/{tenantID}":    {"GET"},
-	"/api/v1/sessions":              {"GET"},
-	"/api/v1/sessions/{sessionID}":  {"GET"},
+	"/api/v1/policies":               {"GET"},
+	"/api/v1/policies/dry-run":       {"POST"},
+	"/api/v1/policies/{policyID}":    {"GET"},
+	"/api/v1/routing":                {"GET"},
+	"/api/v1/routing/{routeID}":      {"GET"},
+	"/api/v1/tenants":                {"GET"},
+	"/api/v1/tenants/{tenantID}":     {"GET"},
+	"/api/v1/sessions":               {"GET"},
+	"/api/v1/sessions/{sessionID}":   {"GET"},
 }
 
 type openAPIDoc struct {

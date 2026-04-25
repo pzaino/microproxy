@@ -102,3 +102,46 @@ func TestValidateAggregatesFieldLevelErrors(t *testing.T) {
 		}
 	}
 }
+
+func TestValidatePolicySemanticErrors(t *testing.T) {
+	cfg := &Config{
+		SchemaVersion: "1",
+		Listeners: []ListenerConfig{{
+			Name:    "l1",
+			Type:    "http",
+			Address: ":8080",
+			Enabled: true,
+		}},
+		Policies: []PolicyConfig{{
+			Name:   "bad-policy",
+			Type:   "inline",
+			Action: "invalid",
+			Selectors: map[string]string{
+				"url_regex":        "[a-",
+				"time_window_utc":  "bad-window",
+				"request_size_min": "abc",
+			},
+			Parameters: map[string]string{"deny_category": "unknown"},
+		}},
+		PolicyEngine: PolicyEngineConfig{ChainMode: "bad"},
+	}
+
+	err := cfg.Validate()
+	if err == nil {
+		t.Fatal("expected policy semantic validation errors")
+	}
+
+	msg := err.Error()
+	for _, expected := range []string{
+		"policies[0].action",
+		"policies[0].selectors.url_regex",
+		"policies[0].selectors.time_window_utc",
+		"policies[0].selectors.request_size_min",
+		"policies[0].parameters.deny_category",
+		"policy_engine.chain_mode",
+	} {
+		if !strings.Contains(msg, expected) {
+			t.Fatalf("expected %q in validation message, got %q", expected, msg)
+		}
+	}
+}
