@@ -15,7 +15,11 @@ func NewRouter(cfg *config.Config) http.Handler {
 
 	// Contract-preserving stubs for planned resources.
 	mux.HandleFunc("GET /api/v1/providers", handlers.StubCollection("providers"))
+	mux.HandleFunc("POST /api/v1/providers", handlers.CreateProvider)
 	mux.HandleFunc("GET /api/v1/providers/{providerID}", handlers.StubItem("providers", "providerID"))
+	mux.HandleFunc("PUT /api/v1/providers/{providerID}", handlers.ReplaceProvider)
+	mux.HandleFunc("PATCH /api/v1/providers/{providerID}", handlers.PatchProvider)
+	mux.HandleFunc("DELETE /api/v1/providers/{providerID}", handlers.DeleteProvider)
 
 	mux.HandleFunc("GET /api/v1/policies", handlers.StubCollection("policies"))
 	mux.HandleFunc("GET /api/v1/policies/{policyID}", handlers.StubItem("policies", "policyID"))
@@ -32,6 +36,7 @@ func NewRouter(cfg *config.Config) http.Handler {
 	return chain(mux,
 		panicRecoveryMiddleware,
 		requestIDMiddleware,
+		authMiddleware,
 		loggingMiddleware,
 	)
 }

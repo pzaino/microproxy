@@ -10,6 +10,10 @@ import (
 	"github.com/pzaino/microproxy/pkg/config"
 )
 
+func withDefaultAuth(req *http.Request) {
+	req.Header.Set(apiKeyHeader, defaultControlAPIKey)
+}
+
 func TestHealthEndpoint(t *testing.T) {
 	h := NewRouter(config.NewConfig())
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/health", nil)
@@ -53,6 +57,7 @@ func TestConfigEndpoint(t *testing.T) {
 	}
 	h := NewRouter(cfg)
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/config", nil)
+	withDefaultAuth(req)
 	rw := httptest.NewRecorder()
 
 	h.ServeHTTP(rw, req)
@@ -95,6 +100,7 @@ func TestConfigEndpoint(t *testing.T) {
 func TestProviderItemEndpointStub(t *testing.T) {
 	h := NewRouter(config.NewConfig())
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/providers/demo", nil)
+	withDefaultAuth(req)
 	rw := httptest.NewRecorder()
 
 	h.ServeHTTP(rw, req)
@@ -112,5 +118,57 @@ func TestProviderItemEndpointStub(t *testing.T) {
 	}
 	if body.Error.RequestID == "" {
 		t.Fatalf("expected request id in error envelope")
+	}
+}
+
+func TestAPIRouteUnauthorized(t *testing.T) {
+	h := NewRouter(config.NewConfig())
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/config", nil)
+	rw := httptest.NewRecorder()
+
+	h.ServeHTTP(rw, req)
+
+	if rw.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 got %d", rw.Code)
+	}
+	var body ErrorEnvelope
+	if err := json.Unmarshal(rw.Body.Bytes(), &body); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if body.Error.Code != "unauthorized" {
+		t.Fatalf("expected unauthorized code, got %q", body.Error.Code)
+	}
+}
+
+func TestAPIRouteForbidden(t *testing.T) {
+	h := NewRouter(config.NewConfig())
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/config", nil)
+	req.Header.Set(apiKeyHeader, "wrong-key")
+	rw := httptest.NewRecorder()
+
+	h.ServeHTTP(rw, req)
+
+	if rw.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 got %d", rw.Code)
+	}
+	var body ErrorEnvelope
+	if err := json.Unmarshal(rw.Body.Bytes(), &body); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if body.Error.Code != "forbidden" {
+		t.Fatalf("expected forbidden code, got %q", body.Error.Code)
+	}
+}
+
+func TestAPIRouteAuthorized(t *testing.T) {
+	h := NewRouter(config.NewConfig())
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/config", nil)
+	withDefaultAuth(req)
+	rw := httptest.NewRecorder()
+
+	h.ServeHTTP(rw, req)
+
+	if rw.Code != http.StatusOK {
+		t.Fatalf("expected 200 got %d", rw.Code)
 	}
 }
