@@ -37,6 +37,7 @@ type RouteDecision struct {
 type RuntimeEndpoint struct {
 	URL      *url.URL
 	Priority int
+	Adapter  UpstreamAdapter
 }
 
 // RuntimeProvider is an upstream provider with candidate endpoints.
@@ -157,18 +158,27 @@ func (h *ForwardProxyHandler) roundTripWithFallback(req *http.Request, endpoints
 
 	var errs []error
 	for i, endpoint := range endpoints {
-		transport := h.Transport.Clone()
-		ep := endpoint.URL
-		transport.Proxy = http.ProxyURL(ep)
-		transport.ResponseHeaderTimeout = timeoutForAttempt(h.Dialer.Timeout, i)
-
-		resp, err := transport.RoundTrip(req)
+		adapter := endpoint.Adapter
+		if adapter == nil {
+			adapter = defaultDirectAdapter{}
+		}
+		preparedReq, err := adapter.PrepareRequest(req, endpoint.URL)
+		if err != nil {
+			class := h.classifyTimeout(err)
+			errs = append(errs, wrapEndpointError(endpoint.URL, err, class))
+			continue
+		}
+		resp, err := adapter.RoundTrip(preparedReq, endpoint.URL, h.Transport, timeoutForAttempt(h.Dialer.Timeout, i))
 		if err == nil {
 			return resp, nil
 		}
 		class := h.classifyTimeout(err)
-		errs = append(errs, wrapEndpointError(ep, err, class))
-		slog.Warn("forward upstream endpoint failed", "provider", providerFromContext(req.Context()), "endpoint", ep.String(), "classification", class, "error", err)
+		errs = append(errs, wrapEndpointError(endpoint.URL, err, class))
+		endpointLabel := "<direct>"
+		if endpoint.URL != nil {
+			endpointLabel = endpoint.URL.String()
+		}
+		slog.Warn("forward upstream endpoint failed", "provider", providerFromContext(req.Context()), "endpoint", endpointLabel, "classification", class, "error", err)
 	}
 	return nil, errors.Join(errs...)
 }
@@ -235,52 +245,19 @@ func (h *ForwardProxyHandler) handleConnect(rw http.ResponseWriter, req *http.Re
 func (h *ForwardProxyHandler) dialConnectViaUpstream(ctx context.Context, targetAddr string, endpoints []RuntimeEndpoint) (net.Conn, error) {
 	var errs []error
 	for _, endpoint := range endpoints {
-		conn, err := h.Dialer.DialContext(ctx, "tcp", endpoint.URL.Host)
+		adapter := endpoint.Adapter
+		if adapter == nil {
+			adapter = defaultDirectAdapter{}
+		}
+		conn, err := adapter.DialConnect(ctx, targetAddr, endpoint.URL, h.Dialer)
 		if err != nil {
 			class := h.classifyTimeout(err)
 			errs = append(errs, wrapEndpointError(endpoint.URL, err, class))
 			continue
 		}
-
-		if err := writeConnect(conn, targetAddr); err != nil {
-			_ = conn.Close()
-			class := h.classifyTimeout(err)
-			errs = append(errs, wrapEndpointError(endpoint.URL, err, class))
-			continue
-		}
-
-		ok, err := readConnectResponse(conn)
-		if err != nil || !ok {
-			_ = conn.Close()
-			if err == nil {
-				err = errors.New("upstream rejected CONNECT")
-			}
-			class := h.classifyTimeout(err)
-			errs = append(errs, wrapEndpointError(endpoint.URL, err, class))
-			continue
-		}
-
 		return conn, nil
 	}
 	return nil, errors.Join(errs...)
-}
-
-func writeConnect(conn net.Conn, targetAddr string) error {
-	_, err := io.WriteString(conn, fmt.Sprintf("CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n", targetAddr, targetAddr))
-	return err
-}
-
-func readConnectResponse(conn net.Conn) (bool, error) {
-	_ = conn.SetReadDeadline(time.Now().Add(10 * time.Second))
-	defer conn.SetReadDeadline(time.Time{})
-
-	buffer := make([]byte, 1024)
-	n, err := conn.Read(buffer)
-	if err != nil {
-		return false, err
-	}
-	line := strings.SplitN(string(buffer[:n]), "\r\n", 2)[0]
-	return strings.Contains(line, " 200 "), nil
 }
 
 func (h *ForwardProxyHandler) resolveRoute(req *http.Request) (RouteDecision, []RuntimeEndpoint, bool) {
@@ -406,6 +383,9 @@ func (h *ForwardProxyHandler) Shutdown(_ context.Context) error {
 }
 
 func wrapEndpointError(endpoint *url.URL, err error, class TimeoutClassification) error {
+	if endpoint == nil {
+		return fmt.Errorf("endpoint <direct> failed (%s): %w", class, err)
+	}
 	return fmt.Errorf("endpoint %s failed (%s): %w", endpoint, class, err)
 }
 
@@ -417,3 +397,25 @@ func timeoutForAttempt(base time.Duration, attempt int) time.Duration {
 }
 
 var _ http.Handler = (*ForwardProxyHandler)(nil)
+
+type defaultDirectAdapter struct{}
+
+func (defaultDirectAdapter) PrepareRequest(req *http.Request, _ *url.URL) (*http.Request, error) {
+	return req.Clone(req.Context()), nil
+}
+
+func (defaultDirectAdapter) DialConnect(ctx context.Context, targetAddr string, _ *url.URL, dialer *net.Dialer) (net.Conn, error) {
+	return dialer.DialContext(ctx, "tcp", targetAddr)
+}
+
+func (defaultDirectAdapter) RoundTrip(req *http.Request, _ *url.URL, transport *http.Transport, responseHeaderTimeout time.Duration) (*http.Response, error) {
+	cloned := transport.Clone()
+	cloned.ResponseHeaderTimeout = responseHeaderTimeout
+	return cloned.RoundTrip(req)
+}
+
+func (defaultDirectAdapter) RotateIdentity(context.Context) error {
+	return ErrRotateIdentityUnsupported
+}
+
+func (defaultDirectAdapter) Capabilities() []string { return []string{"forward", "connect"} }

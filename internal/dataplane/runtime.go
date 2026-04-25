@@ -2,12 +2,10 @@ package dataplane
 
 import (
 	"context"
-	"fmt"
 	"net/http"
 	"net/url"
 	"sort"
 	"strings"
-	"time"
 
 	"github.com/pzaino/microproxy/internal/dataplane/listeners"
 	"github.com/pzaino/microproxy/pkg/config"
@@ -31,6 +29,7 @@ type RuntimeEndpoint struct {
 	URL      *url.URL
 	Priority int
 	Weight   int
+	Adapter  listeners.UpstreamAdapter
 }
 
 // TimeoutClassification identifies whether an error was timeout-related.
@@ -121,9 +120,11 @@ func NewProviderRegistry(cfg *config.Config) *ProviderRegistry {
 	if cfg == nil {
 		return registry
 	}
+	adapterFactory := upstreamAdapterFactory{}
 
 	for _, provider := range cfg.Providers {
 		runtimeProvider := RuntimeProvider{Name: provider.Name}
+		adapter := adapterFactory.ForProvider(provider)
 		for _, endpoint := range provider.Endpoints {
 			parsed, err := url.Parse(endpoint.URL)
 			if err != nil || parsed.Scheme == "" || parsed.Host == "" {
@@ -133,6 +134,7 @@ func NewProviderRegistry(cfg *config.Config) *ProviderRegistry {
 				URL:      parsed,
 				Priority: endpoint.Priority,
 				Weight:   endpoint.Weight,
+				Adapter:  adapter,
 			})
 		}
 		registry.providers[provider.Name] = runtimeProvider
@@ -147,7 +149,7 @@ func (r *ProviderRegistry) Get(provider string) (listeners.RuntimeProvider, bool
 	}
 	endpoints := make([]listeners.RuntimeEndpoint, 0, len(p.Endpoints))
 	for _, ep := range p.Endpoints {
-		endpoints = append(endpoints, listeners.RuntimeEndpoint{URL: ep.URL, Priority: ep.Priority})
+		endpoints = append(endpoints, listeners.RuntimeEndpoint{URL: ep.URL, Priority: ep.Priority, Adapter: ep.Adapter})
 	}
 	return listeners.RuntimeProvider{Name: p.Name, Endpoints: endpoints}, true
 }
@@ -163,7 +165,7 @@ func (s *EndpointSelector) Select(_ context.Context, provider listeners.RuntimeP
 		left := providerPriority(provider, ordered[i])
 		right := providerPriority(provider, ordered[j])
 		if left == right {
-			return ordered[i].URL.String() < ordered[j].URL.String()
+			return describeEndpoint(ordered[i].URL) < describeEndpoint(ordered[j].URL)
 		}
 		return left < right
 	})
@@ -172,7 +174,7 @@ func (s *EndpointSelector) Select(_ context.Context, provider listeners.RuntimeP
 
 func providerPriority(provider listeners.RuntimeProvider, endpoint listeners.RuntimeEndpoint) int {
 	for _, ep := range provider.Endpoints {
-		if ep.URL.String() == endpoint.URL.String() {
+		if describeEndpoint(ep.URL) == describeEndpoint(endpoint.URL) {
 			return ep.Priority
 		}
 	}
@@ -204,18 +206,4 @@ func describeEndpoint(endpoint *url.URL) string {
 		return ""
 	}
 	return endpoint.String()
-}
-
-func wrapEndpointError(endpoint *url.URL, err error, class listeners.TimeoutClassification) error {
-	return fmt.Errorf("endpoint %s failed (%s): %w", describeEndpoint(endpoint), class, err)
-}
-
-func timeoutForAttempt(base time.Duration, attempt int) time.Duration {
-	if base <= 0 {
-		base = 10 * time.Second
-	}
-	if attempt <= 0 {
-		return base
-	}
-	return base + time.Duration(attempt)*250*time.Millisecond
 }
