@@ -1,0 +1,176 @@
+# MicroProxy typed configuration example
+# Version this file alongside your deployments so config changes are reviewed and auditable.
+schema_version: "1"
+
+# listeners: ingress interfaces that accept downstream client traffic.
+# Include only the listeners you need; disable unused protocols by setting enabled: false.
+listeners:
+  # HTTP listener example (plaintext)
+  - name: edge-http
+    type: http
+    address: 0.0.0.0:8080
+    rate_limit: 500
+    auth_type: none # secure default for local/trusted networks only; prefer mTLS/network ACLs at the edge.
+    enabled: true
+
+  # HTTPS listener example (TLS termination)
+  - name: edge-https
+    type: https
+    address: 0.0.0.0:8443
+    tls:
+      cert_file: /etc/microproxy/tls/tls.crt
+      key_file: /etc/microproxy/tls/tls.key
+    rate_limit: 500
+    auth_type: basic # secure auth default: require auth on externally reachable listeners.
+    username: ${MICROPROXY_LISTENER_USER}
+    password: ${MICROPROXY_LISTENER_PASSWORD}
+    enabled: false
+
+  # SOCKS5 listener example
+  - name: edge-socks5
+    type: socks5
+    address: 0.0.0.0:1080
+    rate_limit: 250
+    auth_type: basic
+    username: ${MICROPROXY_SOCKS5_USER}
+    password: ${MICROPROXY_SOCKS5_PASSWORD}
+    enabled: false
+
+# providers: upstream egress options. Supported types include direct/http_proxy/https_proxy/socks5_proxy.
+providers:
+  - name: direct-egress
+    type: direct
+    auth:
+      type: none
+    endpoints:
+      - url: http://direct.local
+        priority: 100
+        weight: 1
+    capabilities: ["direct", "forward", "connect"]
+    health:
+      enabled: false
+
+  - name: corp-http-proxy
+    type: http_proxy
+    auth:
+      type: basic
+      username: ${MICROPROXY_HTTP_PROXY_USER}
+      password: ${MICROPROXY_HTTP_PROXY_PASSWORD}
+    endpoints:
+      - url: http://proxy-a.internal:3128
+        priority: 100
+        weight: 3
+      - url: http://proxy-b.internal:3128
+        priority: 110
+        weight: 1
+    capabilities: ["forward_proxy"]
+    health:
+      enabled: true
+      check_path: /healthz
+      interval_seconds: 15
+      timeout_seconds: 2
+      failure_threshold: 3
+
+  - name: corp-https-proxy
+    type: https_proxy
+    auth:
+      type: bearer
+      token: ${MICROPROXY_HTTPS_PROXY_TOKEN}
+    endpoints:
+      - url: https://secure-proxy.internal:8443
+        priority: 100
+        weight: 1
+    capabilities: ["forward_proxy"]
+    health:
+      enabled: true
+      check_path: /ready
+      interval_seconds: 20
+      timeout_seconds: 3
+      failure_threshold: 3
+
+  - name: partner-socks5
+    type: socks5_proxy
+    auth:
+      type: basic
+      username: ${MICROPROXY_SOCKS5_PROXY_USER}
+      password: ${MICROPROXY_SOCKS5_PROXY_PASSWORD}
+    endpoints:
+      - url: socks5://socks.partner.net:1080
+        priority: 200
+        weight: 1
+    capabilities: ["socks5_proxy"]
+    health:
+      enabled: false
+
+# routing/policies/tenants: choose provider by rule, then apply policy and tenancy boundaries.
+routing:
+  default_provider: corp-http-proxy
+  rules:
+    - name: tenant-a-api
+      match:
+        tenant_id: tenant-a
+        host_suffix: .api.example.com
+      provider: corp-https-proxy
+      policy_ref: redact-sensitive-headers
+    - name: tenant-b-socks-only
+      match:
+        tenant_id: tenant-b
+      provider: partner-socks5
+      policy_ref: block-private-ranges
+
+policies:
+  - name: redact-sensitive-headers
+    type: header
+    # action must be one of:
+    # allow, deny, route_override, headers_patch, redirect, rewrite, response_headers_patch, body_mutation_hook
+    action: redirect # redact
+    selectors:
+      phase: request
+    parameters:
+      header_names: authorization,x-api-key,cookie
+  - name: block-private-ranges
+    type: network
+    action: deny
+    selectors:
+      destination_cidr: 10.0.0.0/8
+    parameters:
+      reason: private_network_protection
+
+policy_engine:
+  # chain mode must be either `stop` or `continue`
+  chain_mode: continue
+  safe_mode:
+    allow_body_mutation: false
+
+tenants:
+  - name: tenant-a
+    id: tenant-a
+    providers: [corp-http-proxy, corp-https-proxy]
+    policies: [redact-sensitive-headers]
+  - name: tenant-b
+    id: tenant-b
+    providers: [partner-socks5]
+    policies: [block-private-ranges]
+
+# observability and health endpoints: enable low-noise logs, metrics, tracing, and probes.
+observability:
+  access_log:
+    enabled: true
+    format: json
+  metrics:
+    enabled: true
+    address: 0.0.0.0:9091
+  tracing:
+    enabled: false
+    exporter: otlp
+    endpoint: otel-collector.monitoring.svc.cluster.local:4317
+  health_endpoints:
+    liveness_address: 0.0.0.0:9090
+    readiness_address: 0.0.0.0:9092
+    startup_address: 0.0.0.0:9093
+
+# secure auth defaults:
+# - Keep secrets out of git; reference env vars or secret files injected by your runtime.
+# - Prefer auth_type=basic (or stronger edge auth) on internet-facing listeners.
+# - Avoid MICROPROXY_DEVELOPMENT_MODE=true in production.
+# - Set MICROPROXY_CONTROLPLANE_API_KEYS or MICROPROXY_CONTROLPLANE_JWTS explicitly.

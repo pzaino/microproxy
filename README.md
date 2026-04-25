@@ -37,6 +37,19 @@ Flags:
 - `-config`: path to a configuration file (`.yaml`, `.yml`, or `.json`).
 - `-health-addr`: health endpoint listen address (default `:9090`).
 
+### Typed configuration examples and profiles
+
+A versioned, fully commented typed config template is available at `deploy/config.example.yaml`.
+
+Deployment profiles are available under `deploy/profiles/`:
+
+- `local-development.yaml`
+- `single-upstream-production.yaml`
+- `multi-provider-failover.yaml`
+- `mixed-http-socks5.yaml`
+
+For migration from legacy `microproxy`/`upstream_proxy` sections to typed root sections, see `docs/migration.md` (includes side-by-side examples).
+
 ### Control-plane authentication environment variables
 
 The control-plane API requires explicit authentication configuration unless development mode is deliberately enabled.
