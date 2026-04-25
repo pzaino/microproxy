@@ -11,4 +11,5 @@ do.patch
 # build and testing artifacts
 config.yaml
 microproxy
+microproxy-control
 

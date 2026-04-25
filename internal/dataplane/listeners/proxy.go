@@ -181,14 +181,23 @@ func copyHeader(dst, src http.Header) {
 }
 
 func removeHopHeaders(headers http.Header) {
-	for header := range hopHeaders {
-		headers.Del(header)
-	}
-
+	connectionTokens := make(map[string]struct{})
 	for _, connectionField := range headers.Values("Connection") {
 		for _, token := range strings.Split(connectionField, ",") {
-			headers.Del(strings.TrimSpace(token))
+			trimmedToken := strings.TrimSpace(token)
+			if trimmedToken == "" {
+				continue
+			}
+			connectionTokens[trimmedToken] = struct{}{}
 		}
+	}
+
+	for token := range connectionTokens {
+		headers.Del(token)
+	}
+
+	for header := range hopHeaders {
+		headers.Del(header)
 	}
 }
 
