@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/pzaino/microproxy/internal/dataplane/listeners"
+	"github.com/pzaino/microproxy/internal/dataplane/policy"
 	"github.com/pzaino/microproxy/pkg/config"
 )
 
@@ -49,6 +50,7 @@ func NewRequestRuntime(cfg *config.Config) listeners.RequestRuntime {
 		Registry:          registry,
 		Selector:          NewEndpointSelector(),
 		ClassifyTimeoutFn: ClassifyTimeout,
+		PolicyEvaluator:   policy.NewEngine(cfg),
 	}
 }
 

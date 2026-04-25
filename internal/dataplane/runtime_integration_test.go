@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net"
@@ -183,6 +184,97 @@ func TestClassifyTimeout(t *testing.T) {
 	<-ctx.Done()
 	if got := ClassifyTimeout(ctx.Err()); string(got) != string(TimeoutDeadline) {
 		t.Fatalf("expected %q, got %q", TimeoutDeadline, got)
+	}
+}
+
+func TestForwardProxy_PolicyDenyBlocksRequest(t *testing.T) {
+	t.Parallel()
+
+	target := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, _ *http.Request) {
+		rw.WriteHeader(http.StatusOK)
+		_, _ = rw.Write([]byte("should-not-reach"))
+	}))
+	defer target.Close()
+
+	cfg := &config.Config{
+		Providers: []config.ProviderConfig{{Name: "provider-a", Type: "direct", Endpoints: []config.ProviderEndpoint{{URL: "http://provider.local"}}}},
+		Routing: config.RoutingConfig{
+			DefaultProvider: "provider-a",
+			Rules:           []config.RoutingRule{{Name: "tenant-rule", Match: map[string]string{"tenant": "tenant-a"}, Provider: "provider-a", PolicyRef: "deny-admin"}},
+		},
+		Policies: []config.PolicyConfig{{
+			Name:      "deny-admin",
+			Action:    "deny",
+			Selectors: map[string]string{"method": "GET", "path_prefix": "/admin"},
+			Parameters: map[string]string{
+				"reason_code": "admin_blocked",
+				"reason":      "admin path denied",
+			},
+		}},
+	}
+
+	proxy := startRuntimeProxy(t, cfg)
+	defer proxy.Close()
+
+	proxyURL, _ := url.Parse(proxy.URL)
+	client := &http.Client{Transport: &http.Transport{Proxy: http.ProxyURL(proxyURL)}}
+	req, _ := http.NewRequest(http.MethodGet, target.URL+"/admin", nil)
+	req.Header.Set("X-Tenant-ID", "tenant-a")
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("policy deny request failed: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusForbidden {
+		t.Fatalf("expected 403, got %d", resp.StatusCode)
+	}
+	var denied map[string]map[string]string
+	if err := json.NewDecoder(resp.Body).Decode(&denied); err != nil {
+		t.Fatalf("decode deny response: %v", err)
+	}
+	if denied["error"]["code"] != "admin_blocked" {
+		t.Fatalf("unexpected deny payload %+v", denied)
+	}
+}
+
+func TestForwardProxy_PolicyHeadersPatchAllowsFlow(t *testing.T) {
+	t.Parallel()
+
+	target := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+		if got := req.Header.Get("X-Policy-Injected"); got != "true" {
+			rw.WriteHeader(http.StatusBadRequest)
+			_, _ = rw.Write([]byte("missing patched header"))
+			return
+		}
+		rw.WriteHeader(http.StatusOK)
+		_, _ = rw.Write([]byte("ok-policy"))
+	}))
+	defer target.Close()
+
+	cfg := &config.Config{
+		Providers: []config.ProviderConfig{{Name: "provider-a", Type: "direct", Endpoints: []config.ProviderEndpoint{{URL: "http://provider.local"}}}},
+		Routing: config.RoutingConfig{
+			DefaultProvider: "provider-a",
+			Rules:           []config.RoutingRule{{Name: "tenant-rule", Match: map[string]string{"tenant": "tenant-a"}, Provider: "provider-a", PolicyRef: "patch-policy"}},
+		},
+		Policies: []config.PolicyConfig{{Name: "patch-policy", Action: "headers_patch", Parameters: map[string]string{"X-Policy-Injected": "true", "Authorization": "forbidden"}}},
+	}
+
+	proxy := startRuntimeProxy(t, cfg)
+	defer proxy.Close()
+
+	proxyURL, _ := url.Parse(proxy.URL)
+	client := &http.Client{Transport: &http.Transport{Proxy: http.ProxyURL(proxyURL)}}
+	req, _ := http.NewRequest(http.MethodGet, target.URL+"/resource", nil)
+	req.Header.Set("X-Tenant-ID", "tenant-a")
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("policy patch request failed: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		body, _ := io.ReadAll(resp.Body)
+		t.Fatalf("expected 200, got %d: %s", resp.StatusCode, string(body))
 	}
 }
 

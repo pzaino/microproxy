@@ -13,9 +13,12 @@ const metadataContextKey contextKey = "request-metadata"
 
 // RequestMetadata carries per-request values for future routing/observability.
 type RequestMetadata struct {
-	RequestID string
-	TenantID  string
-	Provider  string
+	RequestID    string
+	TenantID     string
+	Provider     string
+	Policy       string
+	PolicyAction string
+	PolicyReason string
 }
 
 type metadataRef struct {

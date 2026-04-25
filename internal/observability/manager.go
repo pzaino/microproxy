@@ -204,7 +204,9 @@ func HTTPMiddleware(next http.Handler, accessLogEnabled bool) http.Handler {
 
 		statusCode := rec.statusCode
 		latency := time.Since(start)
-		defaultMetrics.observe(req.Method, statusCode, provider, tenant, latency)
+		policyAction := valueOrDefault(resolvedMetadata.PolicyAction, "allow")
+		policyReason := valueOrDefault(resolvedMetadata.PolicyReason, "none")
+		defaultMetrics.observe(req.Method, statusCode, provider, tenant, policyAction, policyReason, latency)
 
 		if accessLogEnabled {
 			slog.Info("access",
@@ -270,14 +272,14 @@ func newMetricsStore() *metricsStore {
 	}
 }
 
-func (m *metricsStore) observe(method string, status int, provider, tenant string, latency time.Duration) {
+func (m *metricsStore) observe(method string, status int, provider, tenant, policyAction, policyReason string, latency time.Duration) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	counterKey := fmt.Sprintf("%s|%d|%s|%s", method, status, provider, tenant)
+	counterKey := fmt.Sprintf("%s|%d|%s|%s|%s|%s", method, status, provider, tenant, policyAction, policyReason)
 	m.requestTotal[counterKey]++
 
-	histKey := fmt.Sprintf("%s|%s|%s", method, provider, tenant)
+	histKey := fmt.Sprintf("%s|%s|%s|%s", method, provider, tenant, policyAction)
 	h, ok := m.requestLatency[histKey]
 	if !ok {
 		bounds := m.requestLatency[""].bounds
@@ -314,10 +316,20 @@ func (m *metricsStore) handlePrometheus(rw http.ResponseWriter, _ *http.Request)
 	}
 	sort.Strings(counterKeys)
 	for _, key := range counterKeys {
-		parts := strings.SplitN(key, "|", 4)
+		parts := strings.SplitN(key, "|", 6)
 		line := fmt.Sprintf(
-			"microproxy_http_requests_total{method=%q,status=%q,provider=%q,tenant=%q} %d\n",
-			escapeLabel(parts[0]), escapeLabel(parts[1]), escapeLabel(parts[2]), escapeLabel(parts[3]), m.requestTotal[key],
+			"microproxy_http_requests_total{method=%q,status=%q,provider=%q,tenant=%q,policy_action=%q,policy_reason=%q} %d\n",
+			escapeLabel(parts[0]), escapeLabel(parts[1]), escapeLabel(parts[2]), escapeLabel(parts[3]), escapeLabel(parts[4]), escapeLabel(parts[5]), m.requestTotal[key],
+		)
+		_, _ = rw.Write([]byte(line))
+	}
+	_, _ = rw.Write([]byte("# HELP microproxy_policy_decisions_total Total number of policy decisions by action and reason.\n"))
+	_, _ = rw.Write([]byte("# TYPE microproxy_policy_decisions_total counter\n"))
+	for _, key := range counterKeys {
+		parts := strings.SplitN(key, "|", 6)
+		line := fmt.Sprintf(
+			"microproxy_policy_decisions_total{provider=%q,tenant=%q,policy_action=%q,policy_reason=%q} %d\n",
+			escapeLabel(parts[2]), escapeLabel(parts[3]), escapeLabel(parts[4]), escapeLabel(parts[5]), m.requestTotal[key],
 		)
 		_, _ = rw.Write([]byte(line))
 	}
@@ -334,28 +346,28 @@ func (m *metricsStore) handlePrometheus(rw http.ResponseWriter, _ *http.Request)
 	}
 	sort.Strings(histKeys)
 	for _, key := range histKeys {
-		parts := strings.SplitN(key, "|", 3)
+		parts := strings.SplitN(key, "|", 4)
 		h := m.requestLatency[key]
 		cumulative := uint64(0)
 		for i, bound := range h.bounds {
 			cumulative += h.counts[i]
 			_, _ = rw.Write([]byte(fmt.Sprintf(
-				"microproxy_http_request_duration_seconds_bucket{method=%q,provider=%q,tenant=%q,le=%q} %d\n",
-				escapeLabel(parts[0]), escapeLabel(parts[1]), escapeLabel(parts[2]), trimFloat(bound), cumulative,
+				"microproxy_http_request_duration_seconds_bucket{method=%q,provider=%q,tenant=%q,policy_action=%q,le=%q} %d\n",
+				escapeLabel(parts[0]), escapeLabel(parts[1]), escapeLabel(parts[2]), escapeLabel(parts[3]), trimFloat(bound), cumulative,
 			)))
 		}
 		cumulative += h.counts[len(h.counts)-1]
 		_, _ = rw.Write([]byte(fmt.Sprintf(
-			"microproxy_http_request_duration_seconds_bucket{method=%q,provider=%q,tenant=%q,le=%q} %d\n",
-			escapeLabel(parts[0]), escapeLabel(parts[1]), escapeLabel(parts[2]), "+Inf", cumulative,
+			"microproxy_http_request_duration_seconds_bucket{method=%q,provider=%q,tenant=%q,policy_action=%q,le=%q} %d\n",
+			escapeLabel(parts[0]), escapeLabel(parts[1]), escapeLabel(parts[2]), escapeLabel(parts[3]), "+Inf", cumulative,
 		)))
 		_, _ = rw.Write([]byte(fmt.Sprintf(
-			"microproxy_http_request_duration_seconds_sum{method=%q,provider=%q,tenant=%q} %s\n",
-			escapeLabel(parts[0]), escapeLabel(parts[1]), escapeLabel(parts[2]), trimFloat(h.sum),
+			"microproxy_http_request_duration_seconds_sum{method=%q,provider=%q,tenant=%q,policy_action=%q} %s\n",
+			escapeLabel(parts[0]), escapeLabel(parts[1]), escapeLabel(parts[2]), escapeLabel(parts[3]), trimFloat(h.sum),
 		)))
 		_, _ = rw.Write([]byte(fmt.Sprintf(
-			"microproxy_http_request_duration_seconds_count{method=%q,provider=%q,tenant=%q} %d\n",
-			escapeLabel(parts[0]), escapeLabel(parts[1]), escapeLabel(parts[2]), h.count,
+			"microproxy_http_request_duration_seconds_count{method=%q,provider=%q,tenant=%q,policy_action=%q} %d\n",
+			escapeLabel(parts[0]), escapeLabel(parts[1]), escapeLabel(parts[2]), escapeLabel(parts[3]), h.count,
 		)))
 	}
 }

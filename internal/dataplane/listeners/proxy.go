@@ -2,6 +2,7 @@ package listeners
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -66,6 +67,21 @@ type EndpointSelector interface {
 // TimeoutClassifier classifies timeout failures for observability.
 type TimeoutClassifier func(error) TimeoutClassification
 
+// PolicyDecision captures policy evaluation output for a request.
+type PolicyDecision struct {
+	PolicyName    string
+	Action        string
+	DenyCode      string
+	DenyMessage   string
+	RouteOverride string
+	HeadersPatch  map[string]string
+}
+
+// PolicyEvaluator resolves an action for the current request.
+type PolicyEvaluator interface {
+	Evaluate(req *http.Request, metadata RequestMetadata, route RouteDecision) PolicyDecision
+}
+
 // ForwardProxyHandler implements HTTP forward proxying and CONNECT tunneling.
 type ForwardProxyHandler struct {
 	Transport *http.Transport
@@ -75,6 +91,7 @@ type ForwardProxyHandler struct {
 	Registry          ProviderRegistry
 	Selector          EndpointSelector
 	ClassifyTimeoutFn TimeoutClassifier
+	PolicyEvaluator   PolicyEvaluator
 }
 
 func NewForwardProxyHandler() *ForwardProxyHandler {
@@ -97,6 +114,7 @@ func NewForwardProxyHandlerWithRuntime(runtime RequestRuntime) *ForwardProxyHand
 	handler.Registry = runtime.Registry
 	handler.Selector = runtime.Selector
 	handler.ClassifyTimeoutFn = runtime.ClassifyTimeoutFn
+	handler.PolicyEvaluator = runtime.PolicyEvaluator
 	return handler
 }
 
@@ -106,6 +124,7 @@ type RequestRuntime struct {
 	Registry          ProviderRegistry
 	Selector          EndpointSelector
 	ClassifyTimeoutFn TimeoutClassifier
+	PolicyEvaluator   PolicyEvaluator
 }
 
 func (h *ForwardProxyHandler) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
@@ -119,13 +138,28 @@ func (h *ForwardProxyHandler) ServeHTTP(rw http.ResponseWriter, req *http.Reques
 
 func (h *ForwardProxyHandler) handleForward(rw http.ResponseWriter, req *http.Request) {
 	decision, endpoints, resolved := h.resolveRoute(req)
+	metadata, _ := MetadataFromContext(req.Context())
 	if resolved {
 		UpdateMetadata(req.Context(), func(metadata *RequestMetadata) {
 			if decision.TenantID != "" {
 				metadata.TenantID = decision.TenantID
 			}
 			metadata.Provider = decision.Provider
+			metadata.Policy = decision.Policy
 		})
+	}
+	policyDecision := h.evaluatePolicy(req, metadata, decision)
+	h.recordPolicyDecision(req.Context(), policyDecision)
+	if h.applyDeny(rw, policyDecision) {
+		return
+	}
+	if policyDecision.Action == "route_override" {
+		if overrideEndpoints, ok := h.resolveOverrideEndpoints(req, policyDecision.RouteOverride); ok {
+			endpoints = overrideEndpoints
+			UpdateMetadata(req.Context(), func(metadata *RequestMetadata) {
+				metadata.Provider = policyDecision.RouteOverride
+			})
+		}
 	}
 
 	outReq := req.Clone(req.Context())
@@ -137,6 +171,9 @@ func (h *ForwardProxyHandler) handleForward(rw http.ResponseWriter, req *http.Re
 		outReq.URL.Host = req.Host
 	}
 	removeHopHeaders(outReq.Header)
+	if policyDecision.Action == "headers_patch" {
+		patchHeaders(outReq.Header, policyDecision.HeadersPatch)
+	}
 
 	resp, err := h.roundTripWithFallback(outReq, endpoints)
 	if err != nil {
@@ -191,13 +228,28 @@ func (h *ForwardProxyHandler) handleConnect(rw http.ResponseWriter, req *http.Re
 	}
 
 	decision, endpoints, resolved := h.resolveRoute(req)
+	metadata, _ := MetadataFromContext(req.Context())
 	if resolved {
 		UpdateMetadata(req.Context(), func(metadata *RequestMetadata) {
 			if decision.TenantID != "" {
 				metadata.TenantID = decision.TenantID
 			}
 			metadata.Provider = decision.Provider
+			metadata.Policy = decision.Policy
 		})
+	}
+	policyDecision := h.evaluatePolicy(req, metadata, decision)
+	h.recordPolicyDecision(req.Context(), policyDecision)
+	if h.applyDeny(rw, policyDecision) {
+		return
+	}
+	if policyDecision.Action == "route_override" {
+		if overrideEndpoints, ok := h.resolveOverrideEndpoints(req, policyDecision.RouteOverride); ok {
+			endpoints = overrideEndpoints
+			UpdateMetadata(req.Context(), func(metadata *RequestMetadata) {
+				metadata.Provider = policyDecision.RouteOverride
+			})
+		}
 	}
 
 	var targetConn net.Conn
@@ -276,6 +328,48 @@ func (h *ForwardProxyHandler) resolveRoute(req *http.Request) (RouteDecision, []
 		return decision, nil, true
 	}
 	return decision, h.Selector.Select(req.Context(), provider, req), true
+}
+
+func (h *ForwardProxyHandler) resolveOverrideEndpoints(req *http.Request, provider string) ([]RuntimeEndpoint, bool) {
+	if provider == "" || h.Registry == nil || h.Selector == nil {
+		return nil, false
+	}
+	runtimeProvider, ok := h.Registry.Get(provider)
+	if !ok {
+		return nil, false
+	}
+	return h.Selector.Select(req.Context(), runtimeProvider, req), true
+}
+
+func (h *ForwardProxyHandler) evaluatePolicy(req *http.Request, metadata RequestMetadata, route RouteDecision) PolicyDecision {
+	if h.PolicyEvaluator == nil {
+		return PolicyDecision{Action: "allow"}
+	}
+	return h.PolicyEvaluator.Evaluate(req, metadata, route)
+}
+
+func (h *ForwardProxyHandler) applyDeny(rw http.ResponseWriter, policyDecision PolicyDecision) bool {
+	if policyDecision.Action != "deny" {
+		return false
+	}
+	rw.Header().Set("Content-Type", "application/json")
+	rw.WriteHeader(http.StatusForbidden)
+	_ = json.NewEncoder(rw).Encode(map[string]any{
+		"error": map[string]string{
+			"code":    valueOrDefault(policyDecision.DenyCode, "policy_denied"),
+			"message": valueOrDefault(policyDecision.DenyMessage, "request denied by policy"),
+			"policy":  policyDecision.PolicyName,
+		},
+	})
+	return true
+}
+
+func (h *ForwardProxyHandler) recordPolicyDecision(ctx context.Context, decision PolicyDecision) {
+	UpdateMetadata(ctx, func(metadata *RequestMetadata) {
+		metadata.Policy = decision.PolicyName
+		metadata.PolicyAction = valueOrDefault(decision.Action, "allow")
+		metadata.PolicyReason = valueOrDefault(decision.DenyCode, "none")
+	})
 }
 
 func providerFromContext(ctx context.Context) string {
@@ -373,6 +467,12 @@ func removeHopHeaders(headers http.Header) {
 	}
 }
 
+func patchHeaders(headers http.Header, patch map[string]string) {
+	for key, value := range patch {
+		headers.Set(key, value)
+	}
+}
+
 func (h *ForwardProxyHandler) CloseIdleConnections() {
 	h.Transport.CloseIdleConnections()
 }
@@ -394,6 +494,13 @@ func timeoutForAttempt(base time.Duration, attempt int) time.Duration {
 		base = 10 * time.Second
 	}
 	return base + time.Duration(attempt)*250*time.Millisecond
+}
+
+func valueOrDefault(value, fallback string) string {
+	if value == "" {
+		return fallback
+	}
+	return value
 }
 
 var _ http.Handler = (*ForwardProxyHandler)(nil)

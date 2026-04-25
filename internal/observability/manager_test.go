@@ -2,8 +2,10 @@ package observability
 
 import (
 	"context"
+	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -72,5 +74,26 @@ func TestHTTPMiddleware_AddsRequestIDHeader(t *testing.T) {
 
 	if got := rr.Result().Header.Get("X-Request-ID"); got != "req-test" {
 		t.Fatalf("expected X-Request-ID=req-test, got %q", got)
+	}
+}
+
+func TestMetricsStore_EmitsPolicyLabelsAndCounters(t *testing.T) {
+	t.Parallel()
+
+	store := newMetricsStore()
+	store.observe(http.MethodGet, http.StatusForbidden, "provider-a", "tenant-a", "deny", "blocked_scope", 10*time.Millisecond)
+
+	rr := httptest.NewRecorder()
+	store.handlePrometheus(rr, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	body, err := io.ReadAll(rr.Result().Body)
+	if err != nil {
+		t.Fatalf("read metrics body: %v", err)
+	}
+	text := string(body)
+	if !strings.Contains(text, `policy_action="deny"`) {
+		t.Fatalf("expected policy action label in metrics, got: %s", text)
+	}
+	if !strings.Contains(text, "microproxy_policy_decisions_total") {
+		t.Fatalf("expected policy decisions metric in output")
 	}
 }
