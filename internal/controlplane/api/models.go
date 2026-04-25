@@ -38,9 +38,29 @@ type StubListResponse struct {
 }
 
 type Provider struct {
-	ID              string       `json:"id"`
-	ResourceVersion string       `json:"resourceVersion"`
-	Spec            ProviderSpec `json:"spec"`
+	ID              string             `json:"id"`
+	ResourceVersion string             `json:"resourceVersion"`
+	Spec            ProviderSpec       `json:"spec"`
+	Health          ProviderHealthView `json:"health,omitempty"`
+}
+
+type ProviderHealthView struct {
+	State     string                   `json:"state"`
+	Reason    string                   `json:"reason,omitempty"`
+	UpdatedAt time.Time                `json:"updated_at,omitempty"`
+	Endpoints []ProviderEndpointHealth `json:"endpoints,omitempty"`
+}
+
+type ProviderEndpointHealth struct {
+	URL           string    `json:"url"`
+	Priority      int       `json:"priority,omitempty"`
+	Weight        int       `json:"weight,omitempty"`
+	State         string    `json:"state"`
+	Reason        string    `json:"reason,omitempty"`
+	UpdatedAt     time.Time `json:"updated_at,omitempty"`
+	LastSuccessAt time.Time `json:"last_success_at,omitempty"`
+	LastFailureAt time.Time `json:"last_failure_at,omitempty"`
+	LastProbeAt   time.Time `json:"last_probe_at,omitempty"`
 }
 
 type ProviderSpec struct {

@@ -10,6 +10,12 @@ import (
 	"github.com/pzaino/microproxy/pkg/config"
 )
 
+type testTimeoutError struct{ msg string }
+
+func (t testTimeoutError) Error() string   { return t.msg }
+func (t testTimeoutError) Timeout() bool   { return true }
+func (t testTimeoutError) Temporary() bool { return true }
+
 func TestCreateProviderHandlerSuccess(t *testing.T) {
 	h := NewHandlers(config.NewConfig())
 	req := httptest.NewRequest(http.MethodPost, "/api/v1/providers", strings.NewReader(`{"provider":{"id":"p1","name":"Provider 1","type":"http","endpoint":"https://example.test"}}`))
@@ -74,5 +80,40 @@ func TestDeleteProviderHandlerSuccess(t *testing.T) {
 
 	if rw.Code != http.StatusNoContent {
 		t.Fatalf("expected 204 got %d", rw.Code)
+	}
+}
+
+func TestListProvidersIncludesRuntimeHealth(t *testing.T) {
+	cfg := &config.Config{
+		Providers: []config.ProviderConfig{{
+			Name:      "p1",
+			Type:      "http",
+			Endpoints: []config.ProviderEndpoint{{URL: "http://p1-primary.example", Priority: 1}},
+			Health:    config.ProviderHealthConfig{Enabled: true, IntervalSeconds: 1, TimeoutSeconds: 1, FailureThreshold: 1},
+		}},
+	}
+	h := NewHandlers(cfg)
+	provider, _ := h.registry.Get("p1")
+	h.registry.ObserveEndpointOutcome("p1", provider.Endpoints[0].URL, testTimeoutError{msg: "connect timeout"}, "connect_timeout")
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/providers", nil)
+	rw := httptest.NewRecorder()
+	h.ListProviders(rw, req)
+
+	if rw.Code != http.StatusOK {
+		t.Fatalf("expected 200 got %d", rw.Code)
+	}
+	var response ProviderListResponse
+	if err := json.Unmarshal(rw.Body.Bytes(), &response); err != nil {
+		t.Fatalf("unmarshal response: %v", err)
+	}
+	if len(response.Items) != 1 {
+		t.Fatalf("expected 1 provider item, got %d", len(response.Items))
+	}
+	if got := response.Items[0].Health.State; got != "open" {
+		t.Fatalf("expected provider health state open, got %q", got)
+	}
+	if got := response.Items[0].Health.Endpoints[0].Reason; got == "" {
+		t.Fatalf("expected endpoint health reason to be populated")
 	}
 }

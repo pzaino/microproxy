@@ -39,6 +39,16 @@ type RuntimeEndpoint struct {
 	URL      *url.URL
 	Priority int
 	Adapter  UpstreamAdapter
+	Health   EndpointHealthSnapshot
+}
+
+type EndpointHealthSnapshot struct {
+	State         string    `json:"state"`
+	Reason        string    `json:"reason,omitempty"`
+	UpdatedAt     time.Time `json:"updated_at,omitempty"`
+	LastSuccessAt time.Time `json:"last_success_at,omitempty"`
+	LastFailureAt time.Time `json:"last_failure_at,omitempty"`
+	LastProbeAt   time.Time `json:"last_probe_at,omitempty"`
 }
 
 // RuntimeProvider is an upstream provider with candidate endpoints.
@@ -202,14 +212,17 @@ func (h *ForwardProxyHandler) roundTripWithFallback(req *http.Request, endpoints
 		preparedReq, err := adapter.PrepareRequest(req, endpoint.URL)
 		if err != nil {
 			class := h.classifyTimeout(err)
+			h.observeEndpointOutcome(req.Context(), endpoint.URL, err, class)
 			errs = append(errs, wrapEndpointError(endpoint.URL, err, class))
 			continue
 		}
 		resp, err := adapter.RoundTrip(preparedReq, endpoint.URL, h.Transport, timeoutForAttempt(h.Dialer.Timeout, i))
 		if err == nil {
+			h.observeEndpointOutcome(req.Context(), endpoint.URL, nil, "")
 			return resp, nil
 		}
 		class := h.classifyTimeout(err)
+		h.observeEndpointOutcome(req.Context(), endpoint.URL, err, class)
 		errs = append(errs, wrapEndpointError(endpoint.URL, err, class))
 		endpointLabel := "<direct>"
 		if endpoint.URL != nil {
@@ -304,12 +317,26 @@ func (h *ForwardProxyHandler) dialConnectViaUpstream(ctx context.Context, target
 		conn, err := adapter.DialConnect(ctx, targetAddr, endpoint.URL, h.Dialer)
 		if err != nil {
 			class := h.classifyTimeout(err)
+			h.observeEndpointOutcome(ctx, endpoint.URL, err, class)
 			errs = append(errs, wrapEndpointError(endpoint.URL, err, class))
 			continue
 		}
+		h.observeEndpointOutcome(ctx, endpoint.URL, nil, "")
 		return conn, nil
 	}
 	return nil, errors.Join(errs...)
+}
+
+func (h *ForwardProxyHandler) observeEndpointOutcome(ctx context.Context, endpoint *url.URL, err error, class TimeoutClassification) {
+	type endpointOutcomeRecorder interface {
+		ObserveEndpointOutcome(provider string, endpoint *url.URL, err error, class TimeoutClassification)
+	}
+	recorder, ok := h.Registry.(endpointOutcomeRecorder)
+	if !ok {
+		return
+	}
+	metadata, _ := MetadataFromContext(ctx)
+	recorder.ObserveEndpointOutcome(metadata.Provider, endpoint, err, class)
 }
 
 func (h *ForwardProxyHandler) resolveRoute(req *http.Request) (RouteDecision, []RuntimeEndpoint, bool) {

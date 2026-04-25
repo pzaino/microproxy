@@ -8,19 +8,37 @@ import (
 	"strings"
 	"time"
 
+	"github.com/pzaino/microproxy/internal/dataplane"
 	"github.com/pzaino/microproxy/pkg/config"
 )
 
 type Handlers struct {
 	cfg           *config.Config
 	providerStore ProviderStateStore
+	registry      *dataplane.ProviderRegistry
 }
 
 func NewHandlers(cfg *config.Config) *Handlers {
 	if cfg == nil {
 		cfg = config.NewConfig()
 	}
-	return &Handlers{cfg: cfg, providerStore: NewInMemoryProviderStore()}
+	store := NewInMemoryProviderStore()
+	for _, providerCfg := range cfg.Providers {
+		if len(providerCfg.Endpoints) == 0 {
+			continue
+		}
+		_, _ = store.CreateProvider(ProviderSpec{
+			ID:       providerCfg.Name,
+			Name:     providerCfg.Name,
+			Type:     providerCfg.Type,
+			Endpoint: providerCfg.Endpoints[0].URL,
+		})
+	}
+	return &Handlers{
+		cfg:           cfg,
+		providerStore: store,
+		registry:      dataplane.NewProviderRegistry(cfg),
+	}
 }
 
 func (h *Handlers) Health(rw http.ResponseWriter, _ *http.Request) {
@@ -67,7 +85,11 @@ func (h *Handlers) ListProviders(rw http.ResponseWriter, req *http.Request) {
 		writeError(rw, http.StatusMethodNotAllowed, "method_not_allowed", "method not allowed", requestIDFromRequest(req))
 		return
 	}
-	writeJSON(rw, http.StatusOK, ProviderListResponse{Items: h.providerStore.ListProviders()})
+	items := h.providerStore.ListProviders()
+	for i := range items {
+		items[i].Health = h.providerHealth(items[i].ID)
+	}
+	writeJSON(rw, http.StatusOK, ProviderListResponse{Items: items})
 }
 
 func (h *Handlers) GetProvider(rw http.ResponseWriter, req *http.Request) {
@@ -86,7 +108,42 @@ func (h *Handlers) GetProvider(rw http.ResponseWriter, req *http.Request) {
 		writeError(rw, http.StatusNotFound, "not_found", "provider not found", requestIDFromRequest(req))
 		return
 	}
+	provider.Health = h.providerHealth(provider.ID)
 	writeJSON(rw, http.StatusOK, ProviderResponse{Provider: provider})
+}
+
+func (h *Handlers) providerHealth(providerID string) ProviderHealthView {
+	if h.registry == nil {
+		return ProviderHealthView{}
+	}
+	endpoints := h.registry.SnapshotProviderHealth(providerID)
+	if len(endpoints) == 0 {
+		return ProviderHealthView{}
+	}
+	view := ProviderHealthView{State: "healthy", Endpoints: make([]ProviderEndpointHealth, 0, len(endpoints))}
+	for _, endpoint := range endpoints {
+		state := string(endpoint.Health.State)
+		if state == "" {
+			state = "healthy"
+		}
+		if state != "healthy" && view.State == "healthy" {
+			view.State = state
+			view.Reason = endpoint.Health.Reason
+			view.UpdatedAt = endpoint.Health.UpdatedAt
+		}
+		view.Endpoints = append(view.Endpoints, ProviderEndpointHealth{
+			URL:           endpoint.URL,
+			Priority:      endpoint.Priority,
+			Weight:        endpoint.Weight,
+			State:         state,
+			Reason:        endpoint.Health.Reason,
+			UpdatedAt:     endpoint.Health.UpdatedAt,
+			LastSuccessAt: endpoint.Health.LastSuccessAt,
+			LastFailureAt: endpoint.Health.LastFailureAt,
+			LastProbeAt:   endpoint.Health.LastProbeAt,
+		})
+	}
+	return view
 }
 
 func (h *Handlers) CreateProvider(rw http.ResponseWriter, req *http.Request) {
