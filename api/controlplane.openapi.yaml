@@ -40,6 +40,34 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/StubListResponse'
+    post:
+      summary: Create provider (stub)
+      operationId: createProvider
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ProviderCreateRequest'
+      responses:
+        '400':
+          description: Request validation failed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '405':
+          description: Method not allowed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '501':
+          description: Not implemented yet.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
   /api/v1/providers/{providerID}:
     get:
       summary: Get provider (stub)
@@ -47,6 +75,90 @@ paths:
       parameters:
         - $ref: '#/components/parameters/providerID'
       responses:
+        '501':
+          description: Not implemented yet.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+    put:
+      summary: Replace provider (stub)
+      operationId: replaceProvider
+      parameters:
+        - $ref: '#/components/parameters/providerID'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ProviderReplaceRequest'
+      responses:
+        '400':
+          description: Request validation failed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '405':
+          description: Method not allowed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '501':
+          description: Not implemented yet.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+    patch:
+      summary: Patch provider (stub)
+      operationId: patchProvider
+      parameters:
+        - $ref: '#/components/parameters/providerID'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ProviderPatchRequest'
+      responses:
+        '400':
+          description: Request validation failed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '405':
+          description: Method not allowed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '501':
+          description: Not implemented yet.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+    delete:
+      summary: Delete provider (stub)
+      operationId: deleteProvider
+      parameters:
+        - $ref: '#/components/parameters/providerID'
+      responses:
+        '400':
+          description: Request validation failed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '405':
+          description: Method not allowed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
         '501':
           description: Not implemented yet.
           content:
@@ -214,6 +326,56 @@ components:
           items:
             type: object
             additionalProperties: true
+    ProviderCreateRequest:
+      type: object
+      description: Minimal provider create contract accepted by current stub.
+      minProperties: 1
+      additionalProperties: true
+      properties:
+        name:
+          type: string
+          description: Provider display name.
+        type:
+          type: string
+          description: Provider implementation type.
+        endpoint:
+          type: string
+          description: Provider base endpoint URL.
+    ProviderReplaceRequest:
+      type: object
+      description: Minimal provider replace contract accepted by current stub.
+      minProperties: 1
+      additionalProperties: true
+      properties:
+        name:
+          type: string
+          description: Provider display name.
+        type:
+          type: string
+          description: Provider implementation type.
+        endpoint:
+          type: string
+          description: Provider base endpoint URL.
+        enabled:
+          type: boolean
+          description: Whether the provider is enabled.
+    ProviderPatchRequest:
+      type: object
+      description: Minimal provider patch contract accepted by current stub. Empty object is allowed.
+      additionalProperties: true
+      properties:
+        name:
+          type: string
+          description: Provider display name.
+        type:
+          type: string
+          description: Provider implementation type.
+        endpoint:
+          type: string
+          description: Provider base endpoint URL.
+        enabled:
+          type: boolean
+          description: Whether the provider is enabled.
     ErrorEnvelope:
       type: object
       required: [error]
