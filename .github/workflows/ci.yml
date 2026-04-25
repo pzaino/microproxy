@@ -1,0 +1,80 @@
+name: CI
+
+on:
+  pull_request:
+    branches:
+      - main
+      - master
+  push:
+    branches:
+      - main
+      - master
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  go-ci:
+    name: go-ci
+    runs-on: ubuntu-latest
+    env:
+      COVERAGE_THRESHOLD: "60"
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Cache Go build cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/go-build
+          key: ${{ runner.os }}-go-build-${{ hashFiles('**/go.sum') }}
+          restore-keys: |
+            ${{ runner.os }}-go-build-
+
+      - name: Download dependencies
+        run: go mod download
+
+      - name: go vet
+        run: go vet ./...
+
+      - name: staticcheck
+        run: |
+          go install honnef.co/go/tools/cmd/staticcheck@latest
+          staticcheck ./...
+
+      - name: Unit tests
+        run: go test ./...
+
+      - name: Race tests
+        run: go test -race ./...
+
+      - name: Coverage
+        run: go test -covermode=atomic -coverprofile=coverage.out ./...
+
+      - name: Coverage summary and threshold
+        run: |
+          total=$(go tool cover -func=coverage.out | awk '/^total:/ {gsub(/%/, "", $3); print $3}')
+          echo "total=$total" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "## Coverage"
+            echo ""
+            echo "- Total coverage: ${total}%"
+            echo "- Required threshold: ${COVERAGE_THRESHOLD}%"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+          awk -v total="$total" -v threshold="$COVERAGE_THRESHOLD" 'BEGIN {
+            if ((total + 0) < (threshold + 0)) {
+              printf("Coverage %.2f%% is below threshold %.2f%%\\n", total, threshold)
+              exit 1
+            }
+            printf("Coverage %.2f%% meets threshold %.2f%%\\n", total, threshold)
+          }'
