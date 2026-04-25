@@ -37,6 +37,12 @@ Flags:
 - `-config`: path to a configuration file (`.yaml`, `.yml`, or `.json`).
 - `-health-addr`: health endpoint listen address (default `:9090`).
 
+
+## Production readiness
+
+MicroProxy is currently in active development and is not yet production-ready.
+See the detailed roadmap in [`docs/PRODUCTION_READINESS_PLAN.md`](docs/PRODUCTION_READINESS_PLAN.md).
+
 ## Contributing
 
 We welcome contributions! Please read our [contributing guidelines](CONTRIBUTING.md) for more details.
