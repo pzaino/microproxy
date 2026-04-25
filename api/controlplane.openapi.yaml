@@ -21,9 +21,10 @@ paths:
     get:
       summary: Read effective config
       operationId: getConfig
+      description: Returns a sanitized runtime configuration view. Sensitive values are always redacted, including `providers[].auth.password`, `providers[].auth.token`, and sensitive auth header values (for example `Authorization`, `X-Api-Key`, and other auth/token/secret/password header variants).
       responses:
         '200':
-          description: Effective runtime configuration.
+          description: Effective runtime configuration with secrets redacted.
           content:
             application/json:
               schema:

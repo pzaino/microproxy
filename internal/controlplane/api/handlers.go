@@ -28,7 +28,7 @@ func (h *Handlers) Health(rw http.ResponseWriter, _ *http.Request) {
 }
 
 func (h *Handlers) Config(rw http.ResponseWriter, _ *http.Request) {
-	writeJSON(rw, http.StatusOK, ConfigResponse{Config: h.cfg})
+	writeJSON(rw, http.StatusOK, ConfigResponse{Config: NewSanitizedConfigView(h.cfg)})
 }
 
 func (h *Handlers) StubCollection(resource string) http.HandlerFunc {

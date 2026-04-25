@@ -1,6 +1,11 @@
 package api
 
-import "time"
+import (
+	"strings"
+	"time"
+
+	"github.com/pzaino/microproxy/pkg/config"
+)
 
 // HealthResponse is returned by /api/v1/health.
 type HealthResponse struct {
@@ -30,4 +35,60 @@ type ErrorModel struct {
 type StubListResponse struct {
 	Resource string `json:"resource"`
 	Items    []any  `json:"items"`
+}
+
+const redactedSecretValue = "[REDACTED]"
+
+// NewSanitizedConfigView returns a copy of cfg with secrets masked.
+func NewSanitizedConfigView(cfg *config.Config) *config.Config {
+	if cfg == nil {
+		return config.NewConfig()
+	}
+
+	sanitized := *cfg
+	sanitized.Providers = make([]config.ProviderConfig, len(cfg.Providers))
+	for i, provider := range cfg.Providers {
+		sanitizedProvider := provider
+		sanitizedProvider.Auth = sanitizeProviderAuth(provider.Auth)
+		sanitized.Providers[i] = sanitizedProvider
+	}
+
+	return &sanitized
+}
+
+func sanitizeProviderAuth(auth config.ProviderAuthConfig) config.ProviderAuthConfig {
+	sanitized := auth
+
+	if strings.TrimSpace(sanitized.Password) != "" {
+		sanitized.Password = redactedSecretValue
+	}
+	if strings.TrimSpace(sanitized.Token) != "" {
+		sanitized.Token = redactedSecretValue
+	}
+
+	if len(sanitized.Headers) == 0 {
+		return sanitized
+	}
+
+	headers := make(map[string]string, len(sanitized.Headers))
+	for key, value := range sanitized.Headers {
+		if isSensitiveAuthHeader(key) && strings.TrimSpace(value) != "" {
+			headers[key] = redactedSecretValue
+			continue
+		}
+		headers[key] = value
+	}
+	sanitized.Headers = headers
+
+	return sanitized
+}
+
+func isSensitiveAuthHeader(header string) bool {
+	h := strings.ToLower(strings.TrimSpace(header))
+	return strings.Contains(h, "authorization") ||
+		strings.Contains(h, "api-key") ||
+		strings.Contains(h, "apikey") ||
+		strings.Contains(h, "token") ||
+		strings.Contains(h, "secret") ||
+		strings.Contains(h, "password")
 }

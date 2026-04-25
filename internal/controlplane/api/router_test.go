@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/pzaino/microproxy/pkg/config"
@@ -35,6 +36,21 @@ func TestHealthEndpoint(t *testing.T) {
 func TestConfigEndpoint(t *testing.T) {
 	cfg := config.NewConfig()
 	cfg.SchemaVersion = "test-version"
+	cfg.Providers = []config.ProviderConfig{
+		{
+			Name: "test-provider",
+			Auth: config.ProviderAuthConfig{
+				Type:     "api_key",
+				Password: "very-secret-password",
+				Token:    "very-secret-token",
+				Headers: map[string]string{
+					"Authorization": "Bearer very-secret-authz",
+					"X-Api-Key":     "very-secret-api-key",
+					"X-Trace":       "not-secret",
+				},
+			},
+		},
+	}
 	h := NewRouter(cfg)
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/config", nil)
 	rw := httptest.NewRecorder()
@@ -55,6 +71,24 @@ func TestConfigEndpoint(t *testing.T) {
 	}
 	if content["schema_version"] != "test-version" {
 		t.Fatalf("expected schema_version=test-version, got %v", content["schema_version"])
+	}
+
+	payload := rw.Body.String()
+	for _, secret := range []string{
+		"very-secret-password",
+		"very-secret-token",
+		"very-secret-authz",
+		"very-secret-api-key",
+	} {
+		if strings.Contains(payload, secret) {
+			t.Fatalf("expected secret %q to be redacted from payload", secret)
+		}
+	}
+	if !strings.Contains(payload, redactedSecretValue) {
+		t.Fatalf("expected payload to include redaction marker")
+	}
+	if !strings.Contains(payload, "not-secret") {
+		t.Fatalf("expected non-sensitive headers to remain visible")
 	}
 }
 
