@@ -41,7 +41,6 @@ Flags:
 ## Production readiness
 
 MicroProxy is currently in active development and is not yet production-ready.
-See the detailed roadmap in [`docs/PRODUCTION_READINESS_PLAN.md`](docs/PRODUCTION_READINESS_PLAN.md).
 
 ## Contributing
 
