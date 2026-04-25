@@ -18,13 +18,38 @@ type RequestMetadata struct {
 	Provider  string
 }
 
+type metadataRef struct {
+	metadata RequestMetadata
+}
+
 func WithMetadata(ctx context.Context, metadata RequestMetadata) context.Context {
-	return context.WithValue(ctx, metadataContextKey, metadata)
+	return context.WithValue(ctx, metadataContextKey, &metadataRef{metadata: metadata})
 }
 
 func MetadataFromContext(ctx context.Context) (RequestMetadata, bool) {
-	metadata, ok := ctx.Value(metadataContextKey).(RequestMetadata)
-	return metadata, ok
+	switch metadata := ctx.Value(metadataContextKey).(type) {
+	case RequestMetadata:
+		return metadata, true
+	case *metadataRef:
+		if metadata == nil {
+			return RequestMetadata{}, false
+		}
+		return metadata.metadata, true
+	default:
+		return RequestMetadata{}, false
+	}
+}
+
+func UpdateMetadata(ctx context.Context, fn func(metadata *RequestMetadata)) bool {
+	if fn == nil {
+		return false
+	}
+	metadata, ok := ctx.Value(metadataContextKey).(*metadataRef)
+	if !ok || metadata == nil {
+		return false
+	}
+	fn(&metadata.metadata)
+	return true
 }
 
 // MetadataMiddleware injects request metadata and forwards it via request context.

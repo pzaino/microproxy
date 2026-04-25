@@ -68,16 +68,16 @@ func NewListenerManager(cfg *config.Config) ListenerManager {
 		return NoopListenerManager{}
 	}
 
-	return NewHTTPListenerManager(httpListeners, defaultDrainTimeout, cfg.Observability.AccessLog.Enabled)
+	return NewHTTPListenerManager(httpListeners, defaultDrainTimeout, cfg.Observability.AccessLog.Enabled, NewRequestRuntime(cfg))
 }
 
-func NewHTTPListenerManager(listenerConfigs []config.ListenerConfig, drainTimeout time.Duration, accessLogEnabled bool) *HTTPListenerManager {
+func NewHTTPListenerManager(listenerConfigs []config.ListenerConfig, drainTimeout time.Duration, accessLogEnabled bool, runtime listeners.RequestRuntime) *HTTPListenerManager {
 	if drainTimeout <= 0 {
 		drainTimeout = defaultDrainTimeout
 	}
 
-	proxyHandler := listeners.NewForwardProxyHandler()
-	chain := observability.HTTPMiddleware(listeners.MetadataMiddleware(proxyHandler), accessLogEnabled)
+	proxyHandler := listeners.NewForwardProxyHandlerWithRuntime(runtime)
+	chain := listeners.MetadataMiddleware(observability.HTTPMiddleware(proxyHandler, accessLogEnabled))
 
 	states := make([]*serverState, 0, len(listenerConfigs))
 	for _, listenerCfg := range listenerConfigs {

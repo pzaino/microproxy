@@ -1,6 +1,7 @@
 package observability
 
 import (
+	"bufio"
 	"context"
 	"errors"
 	"fmt"
@@ -188,13 +189,18 @@ func HTTPMiddleware(next http.Handler, accessLogEnabled bool) http.Handler {
 	return http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
 		start := time.Now()
 		metadata, _ := listeners.MetadataFromContext(req.Context())
-		provider := valueOrDefault(metadata.Provider, "unknown")
-		tenant := valueOrDefault(metadata.TenantID, "unknown")
 		requestID := valueOrDefault(metadata.RequestID, "unknown")
 		rw.Header().Set("X-Request-ID", requestID)
 
 		rec := &statusRecorder{ResponseWriter: rw, statusCode: http.StatusOK}
 		next.ServeHTTP(rec, req)
+
+		resolvedMetadata, ok := listeners.MetadataFromContext(req.Context())
+		if !ok {
+			resolvedMetadata = metadata
+		}
+		provider := valueOrDefault(resolvedMetadata.Provider, "unknown")
+		tenant := valueOrDefault(resolvedMetadata.TenantID, "unknown")
 
 		statusCode := rec.statusCode
 		latency := time.Since(start)
@@ -222,6 +228,24 @@ type statusRecorder struct {
 func (r *statusRecorder) WriteHeader(code int) {
 	r.statusCode = code
 	r.ResponseWriter.WriteHeader(code)
+}
+
+func (r *statusRecorder) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	hj, ok := r.ResponseWriter.(http.Hijacker)
+	if !ok {
+		return nil, nil, fmt.Errorf("hijacking not supported")
+	}
+	return hj.Hijack()
+}
+
+func (r *statusRecorder) Flush() {
+	if fl, ok := r.ResponseWriter.(http.Flusher); ok {
+		fl.Flush()
+	}
+}
+
+func (r *statusRecorder) Unwrap() http.ResponseWriter {
+	return r.ResponseWriter
 }
 
 type histogramState struct {
