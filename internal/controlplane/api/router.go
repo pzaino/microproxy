@@ -28,6 +28,10 @@ func NewRouterWithError(cfg *config.Config) (http.Handler, error) {
 	mux.HandleFunc("PUT /api/v1/providers/{providerID}", handlers.ReplaceProvider)
 	mux.HandleFunc("PATCH /api/v1/providers/{providerID}", handlers.PatchProvider)
 	mux.HandleFunc("DELETE /api/v1/providers/{providerID}", handlers.DeleteProvider)
+	mux.HandleFunc("POST /api/v1/providers/{providerID}/rotate", handlers.RotateProvider)
+	mux.HandleFunc("POST /api/v1/providers/{providerID}/sessions/{sid}/refresh", handlers.RefreshProviderSession)
+	mux.HandleFunc("GET /api/v1/providers/{providerID}/capabilities", handlers.GetProviderCapabilities)
+	mux.HandleFunc("GET /api/v1/operations/{operationID}", handlers.GetOperationStatus)
 
 	mux.HandleFunc("GET /api/v1/policies", handlers.StubCollection("policies"))
 	mux.HandleFunc("GET /api/v1/policies/{policyID}", handlers.StubItem("policies", "policyID"))

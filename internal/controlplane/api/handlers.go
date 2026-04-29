@@ -9,10 +9,10 @@ import (
 	"strings"
 	"time"
 
+	"github.com/pzaino/microproxy/internal/controlplane/runtimeapply"
 	"github.com/pzaino/microproxy/internal/dataplane"
 	"github.com/pzaino/microproxy/internal/dataplane/listeners"
 	"github.com/pzaino/microproxy/internal/dataplane/policy"
-	"github.com/pzaino/microproxy/internal/controlplane/runtimeapply"
 	"github.com/pzaino/microproxy/pkg/config"
 )
 
@@ -23,6 +23,7 @@ type Handlers struct {
 	registry      *dataplane.ProviderRegistry
 	policyEngine  *policy.Engine
 	applyManager  *runtimeapply.Manager
+	ops           *opStore
 }
 
 func NewHandlers(cfg *config.Config) *Handlers {
@@ -47,6 +48,7 @@ func NewHandlers(cfg *config.Config) *Handlers {
 		resolver:      dataplane.NewRouteResolver(cfg),
 		registry:      dataplane.NewProviderRegistry(cfg),
 		policyEngine:  policy.NewEngine(cfg),
+		ops:           newOpStore(),
 	}
 	h.applyManager = runtimeapply.New(cfg, providerStoreAdapter{store: store}, runtimeapply.RuntimeComponents{
 		Resolver:         &h.resolver,
@@ -465,7 +467,9 @@ func (a providerStoreAdapter) PatchProvider(id, expectedVersion string, patch ma
 	p, err := a.store.PatchProvider(id, expectedVersion, patch)
 	return toRuntimeApplyProvider(p), err
 }
-func (a providerStoreAdapter) DeleteProvider(id, expectedVersion string) error { return a.store.DeleteProvider(id, expectedVersion) }
+func (a providerStoreAdapter) DeleteProvider(id, expectedVersion string) error {
+	return a.store.DeleteProvider(id, expectedVersion)
+}
 
 func toRuntimeApplySpec(spec ProviderSpec) runtimeapply.ProviderSpec {
 	return runtimeapply.ProviderSpec{ID: spec.ID, Name: spec.Name, Type: spec.Type, Endpoint: spec.Endpoint}

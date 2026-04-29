@@ -65,10 +65,30 @@ type ProviderEndpointHealth struct {
 }
 
 type ProviderSpec struct {
-	ID       string `json:"id,omitempty"`
-	Name     string `json:"name"`
-	Type     string `json:"type"`
-	Endpoint string `json:"endpoint"`
+	ID         string         `json:"id,omitempty"`
+	Name       string         `json:"name"`
+	Type       string         `json:"type"`
+	Protocol   string         `json:"protocol,omitempty"`
+	Endpoint   string         `json:"endpoint"`
+	AuthModes  []string       `json:"auth_modes,omitempty"`
+	Rotation   map[string]any `json:"rotation,omitempty"`
+	Session    map[string]any `json:"session,omitempty"`
+	GeoTarget  map[string]any `json:"geotargeting,omitempty"`
+	Limits     map[string]any `json:"limits,omitempty"`
+	HealthMeta map[string]any `json:"health_strategy,omitempty"`
+}
+
+type ProviderCapabilitiesResponse struct {
+	Capabilities ProviderSpec `json:"capabilities"`
+}
+
+type AsyncOperation struct {
+	ID         string      `json:"id"`
+	Status     string      `json:"status"`
+	Kind       string      `json:"kind"`
+	ProviderID string      `json:"provider_id"`
+	SessionID  string      `json:"session_id,omitempty"`
+	Error      *ErrorModel `json:"error,omitempty"`
 }
 
 type ProviderWriteRequest struct {

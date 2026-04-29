@@ -66,12 +66,17 @@ type TLSConfig struct {
 
 // ProviderConfig defines a typed upstream provider.
 type ProviderConfig struct {
-	Name         string               `json:"name" yaml:"name"`
-	Type         string               `json:"type" yaml:"type"`
-	Auth         ProviderAuthConfig   `json:"auth" yaml:"auth"`
-	Endpoints    []ProviderEndpoint   `json:"endpoints" yaml:"endpoints"`
-	Capabilities []string             `json:"capabilities" yaml:"capabilities"`
-	Health       ProviderHealthConfig `json:"health" yaml:"health"`
+	Name         string                     `json:"name" yaml:"name"`
+	Type         string                     `json:"type" yaml:"type"`
+	Protocol     string                     `json:"protocol,omitempty" yaml:"protocol,omitempty"`
+	Auth         ProviderAuthConfig         `json:"auth" yaml:"auth"`
+	Endpoints    []ProviderEndpoint         `json:"endpoints" yaml:"endpoints"`
+	Capabilities []string                   `json:"capabilities" yaml:"capabilities"`
+	Rotation     ProviderRotationConfig     `json:"rotation,omitempty" yaml:"rotation,omitempty"`
+	Session      ProviderSessionConfig      `json:"session,omitempty" yaml:"session,omitempty"`
+	GeoTargeting ProviderGeoTargetingConfig `json:"geo_targeting,omitempty" yaml:"geo_targeting,omitempty"`
+	Limits       ProviderLimitsConfig       `json:"limits,omitempty" yaml:"limits,omitempty"`
+	Health       ProviderHealthConfig       `json:"health" yaml:"health"`
 }
 
 type ProviderAuthConfig struct {
@@ -86,10 +91,33 @@ type ProviderEndpoint struct {
 	URL      string `json:"url" yaml:"url"`
 	Priority int    `json:"priority,omitempty" yaml:"priority,omitempty"`
 	Weight   int    `json:"weight,omitempty" yaml:"weight,omitempty"`
+	Region   string `json:"region,omitempty" yaml:"region,omitempty"`
+	Country  string `json:"country,omitempty" yaml:"country,omitempty"`
+}
+
+type ProviderRotationConfig struct {
+	Enabled bool   `json:"enabled" yaml:"enabled"`
+	Mode    string `json:"mode,omitempty" yaml:"mode,omitempty"`
+}
+
+type ProviderSessionConfig struct {
+	Supported        bool `json:"supported" yaml:"supported"`
+	RefreshSupported bool `json:"refresh_supported" yaml:"refresh_supported"`
+}
+
+type ProviderGeoTargetingConfig struct {
+	Supported bool     `json:"supported" yaml:"supported"`
+	Modes     []string `json:"modes,omitempty" yaml:"modes,omitempty"`
+}
+
+type ProviderLimitsConfig struct {
+	MaxRequestsPerMinute int `json:"max_requests_per_minute,omitempty" yaml:"max_requests_per_minute,omitempty"`
+	Concurrency          int `json:"concurrency,omitempty" yaml:"concurrency,omitempty"`
 }
 
 type ProviderHealthConfig struct {
 	Enabled          bool   `json:"enabled" yaml:"enabled"`
+	Strategy         string `json:"strategy,omitempty" yaml:"strategy,omitempty"`
 	CheckPath        string `json:"check_path,omitempty" yaml:"check_path,omitempty"`
 	IntervalSeconds  int    `json:"interval_seconds,omitempty" yaml:"interval_seconds,omitempty"`
 	TimeoutSeconds   int    `json:"timeout_seconds,omitempty" yaml:"timeout_seconds,omitempty"`

@@ -191,6 +191,30 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorEnvelope'
+  /api/v1/providers/{providerID}/rotate:
+    post:
+      summary: Rotate provider endpoint/session
+      operationId: rotateProvider
+      responses:
+        '202': {description: Accepted}
+  /api/v1/providers/{providerID}/sessions/{sid}/refresh:
+    post:
+      summary: Refresh provider session
+      operationId: refreshProviderSession
+      responses:
+        '202': {description: Accepted}
+  /api/v1/providers/{providerID}/capabilities:
+    get:
+      summary: Get provider capabilities
+      operationId: getProviderCapabilities
+      responses:
+        '200': {description: Provider capabilities}
+  /api/v1/operations/{operationID}:
+    get:
+      summary: Get async operation status
+      operationId: getOperationStatus
+      responses:
+        '200': {description: Operation status}
   /api/v1/policies:
     get:
       summary: List policies (stub)
