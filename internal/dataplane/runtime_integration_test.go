@@ -257,6 +257,9 @@ func TestForwardProxy_PolicyHeadersPatchAllowsFlow(t *testing.T) {
 			DefaultProvider: "provider-a",
 			Rules:           []config.RoutingRule{{Name: "tenant-rule", Match: map[string]string{"tenant": "tenant-a"}, Provider: "provider-a", PolicyRef: "patch-policy"}},
 		},
+		PolicyEngine: config.PolicyEngineConfig{
+			SafeMode: config.PolicySafeModeFlag{AllowRequestHeaderMutation: true},
+		},
 		Policies: []config.PolicyConfig{{Name: "patch-policy", Action: "headers_patch", Parameters: map[string]string{"X-Policy-Injected": "true", "Authorization": "forbidden"}}},
 	}
 
