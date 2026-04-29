@@ -24,6 +24,7 @@ type Handlers struct {
 	policyEngine  *policy.Engine
 	applyManager  *runtimeapply.Manager
 	ops           *opStore
+	audit         *auditLog
 }
 
 func NewHandlers(cfg *config.Config) *Handlers {
@@ -49,6 +50,7 @@ func NewHandlers(cfg *config.Config) *Handlers {
 		registry:      dataplane.NewProviderRegistry(cfg),
 		policyEngine:  policy.NewEngine(cfg),
 		ops:           newOpStore(),
+		audit:         &auditLog{},
 	}
 	h.applyManager = runtimeapply.New(cfg, providerStoreAdapter{store: store}, runtimeapply.RuntimeComponents{
 		Resolver:         &h.resolver,
@@ -193,6 +195,7 @@ func (h *Handlers) CreateProvider(rw http.ResponseWriter, req *http.Request) {
 		return
 	}
 
+	h.emitAudit(req, "providers.create", nil, provider, "applied")
 	writeJSON(rw, http.StatusCreated, ProviderResponse{Provider: fromRuntimeApplyProvider(provider)})
 }
 
@@ -240,6 +243,8 @@ func (h *Handlers) ReplaceProvider(rw http.ResponseWriter, req *http.Request) {
 		return
 	}
 
+	h.emitAudit(req, "providers.write", nil, provider, "applied")
+	h.emitAudit(req, "providers.patch", nil, provider, "applied")
 	writeJSON(rw, http.StatusOK, ProviderResponse{Provider: fromRuntimeApplyProvider(provider)})
 }
 
@@ -323,6 +328,7 @@ func (h *Handlers) DeleteProvider(rw http.ResponseWriter, req *http.Request) {
 		}
 		return
 	}
+	h.emitAudit(req, "providers.delete", providerID, nil, "applied")
 	writeNoContent(rw)
 }
 
@@ -482,4 +488,10 @@ func toRuntimeApplyProvider(p Provider) runtimeapply.Provider {
 }
 func fromRuntimeApplyProvider(p runtimeapply.Provider) Provider {
 	return Provider{ID: p.ID, ResourceVersion: p.ResourceVersion, Spec: fromRuntimeApplySpec(p.Spec)}
+}
+
+
+func (h *Handlers) emitAudit(req *http.Request, action string, before, after any, result string) {
+	if h == nil || h.audit == nil { return }
+	h.audit.append(auditRecord{Actor: actorFromRequest(req), Timestamp: time.Now().UTC(), RequestID: requestIDFromRequest(req), Action: req.Method+" "+req.URL.Path+"#"+action, Before: hashAny(before), After: hashAny(after), Result: result})
 }

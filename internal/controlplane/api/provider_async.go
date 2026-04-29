@@ -52,6 +52,7 @@ func (h *Handlers) RotateProvider(rw http.ResponseWriter, req *http.Request) {
 		return
 	}
 	op := h.ops.create("provider.rotate", pid, "", strings.TrimSpace(req.Header.Get("Idempotency-Key")))
+	h.emitAudit(req, "providers.rotate", pid, op, "applied")
 	writeJSON(rw, http.StatusAccepted, map[string]any{"operation": op})
 }
 func (h *Handlers) RefreshProviderSession(rw http.ResponseWriter, req *http.Request) {
@@ -66,6 +67,7 @@ func (h *Handlers) RefreshProviderSession(rw http.ResponseWriter, req *http.Requ
 		return
 	}
 	op := h.ops.create("provider.session.refresh", pid, sid, strings.TrimSpace(req.Header.Get("Idempotency-Key")))
+	h.emitAudit(req, "providers.rotate", pid, op, "applied")
 	writeJSON(rw, http.StatusAccepted, map[string]any{"operation": op})
 }
 func (h *Handlers) GetProviderCapabilities(rw http.ResponseWriter, req *http.Request) {

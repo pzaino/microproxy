@@ -213,3 +213,20 @@ func TestNewRouterWithErrorDevelopmentModeAllowsDefaultKey(t *testing.T) {
 		t.Fatalf("expected 200 got %d", rw.Code)
 	}
 }
+
+
+func TestRoleScopedAccess(t *testing.T) {
+	t.Setenv(controlPlaneAPIKeysEnv, "obs=observer,op=operator,adm=admin")
+	t.Setenv(controlPlaneJWTsEnv, "")
+	t.Setenv(developmentModeEnv, "false")
+	h := NewRouter(config.NewConfig())
+	unauth := httptest.NewRequest(http.MethodPost, "/api/v1/providers", strings.NewReader(`{}`))
+	rw := httptest.NewRecorder(); h.ServeHTTP(rw, unauth)
+	if rw.Code != http.StatusUnauthorized { t.Fatalf("expected 401 got %d", rw.Code) }
+	forbidden := httptest.NewRequest(http.MethodPost, "/api/v1/providers", strings.NewReader(`{}`)); forbidden.Header.Set(apiKeyHeader, "obs")
+	rw = httptest.NewRecorder(); h.ServeHTTP(rw, forbidden)
+	if rw.Code != http.StatusForbidden { t.Fatalf("expected 403 got %d", rw.Code) }
+	allowed := httptest.NewRequest(http.MethodPost, "/api/v1/providers", strings.NewReader(`{"provider":{"id":"p1","name":"n","type":"http","endpoint":"https://e"}}`)); allowed.Header.Set(apiKeyHeader, "op")
+	rw = httptest.NewRecorder(); h.ServeHTTP(rw, allowed)
+	if rw.Code != http.StatusCreated { t.Fatalf("expected 201 got %d", rw.Code) }
+}

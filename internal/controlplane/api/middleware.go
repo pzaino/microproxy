@@ -21,12 +21,29 @@ const (
 	controlPlaneAPIKeysEnv = "MICROPROXY_CONTROLPLANE_API_KEYS"
 	controlPlaneJWTsEnv    = "MICROPROXY_CONTROLPLANE_JWTS"
 	developmentModeEnv     = "MICROPROXY_DEVELOPMENT_MODE"
+	startupModeEnv         = "MICROPROXY_STARTUP_MODE"
+	profileEnv             = "MICROPROXY_PROFILE"
 	defaultControlAPIKey   = "microproxy-controlplane-dev-key"
 )
 
 type contextKey string
 
 const requestIDContextKey contextKey = "request_id"
+const actorContextKey contextKey = "actor"
+
+type role string
+
+const (
+	roleObserver role = "observer"
+	roleOperator role = "operator"
+	roleAdmin    role = "admin"
+)
+
+type actorIdentity struct {
+	Kind string
+	ID   string
+	Role role
+}
 
 var requestCounter uint64
 
@@ -118,14 +135,17 @@ func newAuthMiddleware() (func(http.Handler) http.Handler, error) {
 }
 
 type requestAuthenticator struct {
-	apiKeys map[string]struct{}
-	jwts    map[string]struct{}
+	apiKeys map[string]actorIdentity
+	jwts    map[string]actorIdentity
 }
 
 func newAuthenticator() (requestAuthenticator, error) {
-	apiKeys := parseCredentialSet(os.Getenv(controlPlaneAPIKeysEnv))
-	jwts := parseCredentialSet(os.Getenv(controlPlaneJWTsEnv))
+	apiKeys := parseCredentialSetWithRoles(os.Getenv(controlPlaneAPIKeysEnv), "api_key")
+	jwts := parseCredentialSetWithRoles(os.Getenv(controlPlaneJWTsEnv), "jwt")
 	developmentMode := parseDevelopmentMode(os.Getenv(developmentModeEnv))
+	if developmentMode && (isProductionMode(os.Getenv(startupModeEnv)) || isProductionMode(os.Getenv(profileEnv))) {
+		return requestAuthenticator{}, fmt.Errorf("invalid control-plane auth configuration: %s cannot be enabled when %s or %s is production", developmentModeEnv, startupModeEnv, profileEnv)
+	}
 
 	if len(apiKeys) == 0 && len(jwts) == 0 && !developmentMode {
 		return requestAuthenticator{}, fmt.Errorf(
@@ -137,7 +157,7 @@ func newAuthenticator() (requestAuthenticator, error) {
 	}
 
 	if len(apiKeys) == 0 && developmentMode {
-		apiKeys[defaultControlAPIKey] = struct{}{}
+		apiKeys[defaultControlAPIKey] = actorIdentity{Kind: "api_key", ID: defaultControlAPIKey, Role: roleAdmin}
 	}
 
 	return requestAuthenticator{
@@ -146,17 +166,37 @@ func newAuthenticator() (requestAuthenticator, error) {
 	}, nil
 }
 
-func parseCredentialSet(raw string) map[string]struct{} {
-	values := make(map[string]struct{})
+func parseCredentialSetWithRoles(raw, kind string) map[string]actorIdentity {
+	values := make(map[string]actorIdentity)
 	for _, entry := range strings.Split(raw, ",") {
 		trimmed := strings.TrimSpace(entry)
 		if trimmed == "" {
 			continue
 		}
-		values[trimmed] = struct{}{}
+		credential := trimmed
+		assignedRole := roleAdmin
+		if parts := strings.SplitN(trimmed, "=", 2); len(parts) == 2 {
+			credential = strings.TrimSpace(parts[0])
+			assignedRole = parseRole(parts[1])
+		}
+		if credential == "" {
+			continue
+		}
+		values[credential] = actorIdentity{Kind: kind, ID: credential, Role: assignedRole}
 	}
 	return values
 }
+
+func parseRole(raw string) role {
+	switch role(strings.ToLower(strings.TrimSpace(raw))) {
+	case roleObserver, roleOperator, roleAdmin:
+		return role(strings.ToLower(strings.TrimSpace(raw)))
+	default:
+		return roleAdmin
+	}
+}
+
+func isProductionMode(raw string) bool { return strings.EqualFold(strings.TrimSpace(raw), "production") }
 
 func parseDevelopmentMode(raw string) bool {
 	switch strings.ToLower(strings.TrimSpace(raw)) {
@@ -179,17 +219,52 @@ func (a requestAuthenticator) authorize(req *http.Request) (bool, int, string, s
 	}
 
 	if apiKey != "" {
-		if _, ok := a.apiKeys[apiKey]; ok {
+		if actor, ok := a.apiKeys[apiKey]; ok {
+			req.Header.Set("X-Actor-Role", string(actor.Role))
+			req.Header.Set("X-Actor-ID", actor.ID)
+			req.Header.Set("X-Actor-Kind", actor.Kind)
 			return true, 0, "", ""
 		}
 	}
 	if jwt != "" {
-		if _, ok := a.jwts[jwt]; ok {
+		if actor, ok := a.jwts[jwt]; ok {
+			req.Header.Set("X-Actor-Role", string(actor.Role))
+			req.Header.Set("X-Actor-ID", actor.ID)
+			req.Header.Set("X-Actor-Kind", actor.Kind)
 			return true, 0, "", ""
 		}
 	}
 
 	return false, http.StatusForbidden, "forbidden", "invalid authentication credentials"
+}
+
+func roleAuthorizeMiddleware(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+		if !strings.HasPrefix(req.URL.Path, "/api/v1/") || req.URL.Path == "/api/v1/health" {
+			next.ServeHTTP(rw, req)
+			return
+		}
+		role := parseRole(req.Header.Get("X-Actor-Role"))
+		if !isRoleAllowed(role, req.Method, req.URL.Path) {
+			writeError(rw, http.StatusForbidden, "forbidden", "insufficient role permissions", requestIDFromRequest(req))
+			return
+		}
+		ctx := context.WithValue(req.Context(), actorContextKey, actorIdentity{Kind: req.Header.Get("X-Actor-Kind"), ID: req.Header.Get("X-Actor-ID"), Role: role})
+		next.ServeHTTP(rw, req.WithContext(ctx))
+	})
+}
+
+func isRoleAllowed(r role, method, path string) bool {
+	if method == http.MethodGet {
+		return true
+	}
+	if r == roleAdmin {
+		return true
+	}
+	if r == roleOperator {
+		return path == "/api/v1/providers" || strings.HasPrefix(path, "/api/v1/providers/")
+	}
+	return false
 }
 
 func extractBearerToken(authorization string) (token string, status int, code, message string) {

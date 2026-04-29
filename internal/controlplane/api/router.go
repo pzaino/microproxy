@@ -55,6 +55,7 @@ func NewRouterWithError(cfg *config.Config) (http.Handler, error) {
 		panicRecoveryMiddleware,
 		requestIDMiddleware,
 		authMiddleware,
+		roleAuthorizeMiddleware,
 		loggingMiddleware,
 	), nil
 }

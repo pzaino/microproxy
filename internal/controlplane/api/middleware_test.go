@@ -33,7 +33,7 @@ func TestNewAuthenticatorDevelopmentModeUsesDefaultAPIKey(t *testing.T) {
 }
 
 func TestAuthorizeWithoutConfiguredCredentialsReturnsForbidden(t *testing.T) {
-	a := requestAuthenticator{apiKeys: map[string]struct{}{}, jwts: map[string]struct{}{}}
+	a := requestAuthenticator{apiKeys: map[string]actorIdentity{}, jwts: map[string]actorIdentity{}}
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/config", nil)
 	req.Header.Set(apiKeyHeader, "unknown-key")
 
@@ -59,5 +59,16 @@ func TestParseDevelopmentMode(t *testing.T) {
 		if parseDevelopmentMode(value) {
 			t.Fatalf("expected %q to disable development mode", value)
 		}
+	}
+}
+
+
+func TestNewAuthenticatorRejectsDevelopmentModeInProduction(t *testing.T) {
+	t.Setenv(controlPlaneAPIKeysEnv, "")
+	t.Setenv(controlPlaneJWTsEnv, "")
+	t.Setenv(developmentModeEnv, "true")
+	t.Setenv(startupModeEnv, "production")
+	if _, err := newAuthenticator(); err == nil {
+		t.Fatalf("expected production startup mode to reject development authentication")
 	}
 }
