@@ -145,3 +145,13 @@ func TestValidatePolicySemanticErrors(t *testing.T) {
 		}
 	}
 }
+
+func TestConfigExampleHasNoValidationErrors(t *testing.T) {
+	cfg, err := LoadConfig("../../deploy/config.example.yaml")
+	if err != nil {
+		t.Fatalf("expected deploy/config.example.yaml to load cleanly, got: %v", err)
+	}
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("expected zero validation errors for deploy/config.example.yaml, got: %v", err)
+	}
+}
