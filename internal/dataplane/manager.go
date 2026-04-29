@@ -128,13 +128,14 @@ func NewHTTPListenerManager(listenerConfigs []config.ListenerConfig, drainTimeou
 	}
 
 	proxyHandler := listeners.NewForwardProxyHandlerWithRuntime(runtime)
-	chain := listeners.MetadataMiddleware(observability.HTTPMiddleware(proxyHandler, accessLogEnabled))
 
 	states := make([]*serverState, 0, len(listenerConfigs))
 	for _, listenerCfg := range listenerConfigs {
+		baseChain := listeners.MetadataMiddleware(observability.HTTPMiddleware(proxyHandler, accessLogEnabled))
+		authChain := listeners.ListenerAuthMiddleware(listenerCfg.AuthType, listenerCfg.Username, listenerCfg.Password, baseChain)
 		server := &http.Server{
 			Addr:    listenerCfg.Address,
-			Handler: chain,
+			Handler: authChain,
 		}
 
 		state := &serverState{
