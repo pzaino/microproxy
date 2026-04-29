@@ -32,9 +32,12 @@ type compiledPolicy struct {
 
 // Engine evaluates policies referenced by resolved route decisions.
 type Engine struct {
-	policies           map[string]compiledPolicy
-	defaultChainMode   string
-	allowBodyMutations bool
+	policies               map[string]compiledPolicy
+	defaultChainMode       string
+	allowRequestHeaderMute bool
+	allowResponseHeaderMut bool
+	allowRedirectRewrite   bool
+	allowBodyMutations     bool
 }
 
 func NewEngine(cfg *config.Config) *Engine {
@@ -48,6 +51,9 @@ func NewEngine(cfg *config.Config) *Engine {
 	if mode := strings.ToLower(strings.TrimSpace(cfg.PolicyEngine.ChainMode)); mode == "continue" {
 		engine.defaultChainMode = mode
 	}
+	engine.allowRequestHeaderMute = cfg.PolicyEngine.SafeMode.AllowRequestHeaderMutation
+	engine.allowResponseHeaderMut = cfg.PolicyEngine.SafeMode.AllowResponseHeaderMutation
+	engine.allowRedirectRewrite = cfg.PolicyEngine.SafeMode.AllowRedirectRewrite
 	engine.allowBodyMutations = cfg.PolicyEngine.SafeMode.AllowBodyMutation
 
 	for _, policy := range cfg.Policies {
@@ -83,9 +89,13 @@ func (e *Engine) Evaluate(req *http.Request, metadata listeners.RequestMetadata,
 			trace = append(trace, policy.Name+":skip")
 			continue
 		}
-		current := applyAction(policy.PolicyConfig, e.allowBodyMutations)
+		current, suppression := applyAction(policy.PolicyConfig, e.allowRequestHeaderMute, e.allowResponseHeaderMut, e.allowRedirectRewrite, e.allowBodyMutations)
 		current.PolicyName = policy.Name
-		trace = append(trace, policy.Name+":"+current.Action)
+		if suppression != "" {
+			trace = append(trace, policy.Name+":suppressed:"+suppression)
+		} else {
+			trace = append(trace, policy.Name+":"+current.Action)
+		}
 		result = mergeDecisions(result, current)
 		if shouldStop(e.defaultChainMode, policy.Parameters, current.Action) {
 			break
@@ -167,9 +177,10 @@ func compilePolicy(policy config.PolicyConfig) compiledPolicy {
 	return compiled
 }
 
-func applyAction(policy config.PolicyConfig, allowBodyMutations bool) listeners.PolicyDecision {
+func applyAction(policy config.PolicyConfig, allowRequestHeaderMutation, allowResponseHeaderMutation, allowRedirectRewrite, allowBodyMutations bool) (listeners.PolicyDecision, string) {
 	action := strings.ToLower(strings.TrimSpace(policy.Action))
 	result := listeners.PolicyDecision{Action: action}
+	suppressionReason := ""
 	switch action {
 	case ActionDeny:
 		result.DenyCode = valueOrDefault(policy.Parameters["reason_code"], "policy_denied")
@@ -185,15 +196,30 @@ func applyAction(policy config.PolicyConfig, allowBodyMutations bool) listeners.
 		if len(result.HeadersPatch) == 0 {
 			result.Action = ActionAllow
 		}
+		if !allowRequestHeaderMutation {
+			result.Action = ActionAllow
+			result.HeadersPatch = nil
+			suppressionReason = "request_header_mutation_guardrail"
+		}
 	case ActionResponseHeadersPatch:
 		result.ResponseHeadersPatch = extractSafeHeaders(policy.Parameters)
 		if len(result.ResponseHeadersPatch) == 0 {
 			result.Action = ActionAllow
 		}
+		if !allowResponseHeaderMutation {
+			result.Action = ActionAllow
+			result.ResponseHeadersPatch = nil
+			suppressionReason = "response_header_mutation_guardrail"
+		}
 	case ActionRedirect:
 		result.RedirectURL = strings.TrimSpace(policy.Parameters["location"])
 		if result.RedirectURL == "" {
 			result.Action = ActionAllow
+		}
+		if !allowRedirectRewrite {
+			result.Action = ActionAllow
+			result.RedirectURL = ""
+			suppressionReason = "redirect_rewrite_guardrail"
 		}
 	case ActionRewrite:
 		result.RewriteScheme = strings.TrimSpace(policy.Parameters["scheme"])
@@ -202,10 +228,18 @@ func applyAction(policy config.PolicyConfig, allowBodyMutations bool) listeners.
 		if result.RewriteScheme == "" && result.RewriteHost == "" && result.RewritePathPrefix == "" {
 			result.Action = ActionAllow
 		}
+		if !allowRedirectRewrite {
+			result.Action = ActionAllow
+			result.RewriteScheme = ""
+			result.RewriteHost = ""
+			result.RewritePathPrefix = ""
+			suppressionReason = "redirect_rewrite_guardrail"
+		}
 	case ActionBodyMutationHook:
 		if !allowBodyMutations {
 			result.Action = ActionAllow
-			return result
+			suppressionReason = "body_mutation_guardrail"
+			return result, suppressionReason
 		}
 		result.RequestBodyPrefix = policy.Parameters["request_prefix"]
 		result.ResponseBodyPrefix = policy.Parameters["response_prefix"]
@@ -216,7 +250,7 @@ func applyAction(policy config.PolicyConfig, allowBodyMutations bool) listeners.
 	default:
 		result.Action = ActionAllow
 	}
-	return result
+	return result, suppressionReason
 }
 
 func matches(policy compiledPolicy, req *http.Request, metadata listeners.RequestMetadata, route listeners.RouteDecision) bool {

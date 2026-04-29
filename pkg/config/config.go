@@ -150,7 +150,10 @@ type PolicyEngineConfig struct {
 }
 
 type PolicySafeModeFlag struct {
-	AllowBodyMutation bool `json:"allow_body_mutation" yaml:"allow_body_mutation"`
+	AllowRequestHeaderMutation  bool `json:"allow_request_header_mutation" yaml:"allow_request_header_mutation"`
+	AllowResponseHeaderMutation bool `json:"allow_response_header_mutation" yaml:"allow_response_header_mutation"`
+	AllowRedirectRewrite        bool `json:"allow_redirect_rewrite" yaml:"allow_redirect_rewrite"`
+	AllowBodyMutation           bool `json:"allow_body_mutation" yaml:"allow_body_mutation"`
 }
 
 type TenantConfig struct {

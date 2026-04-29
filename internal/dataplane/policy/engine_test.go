@@ -44,7 +44,14 @@ func TestEngineEvaluate_DenyAndMatchers(t *testing.T) {
 func TestEngineEvaluate_AdditionalActionsAndSelectors(t *testing.T) {
 	t.Parallel()
 	cfg := &config.Config{
-		PolicyEngine: config.PolicyEngineConfig{ChainMode: "continue"},
+		PolicyEngine: config.PolicyEngineConfig{
+			ChainMode: "continue",
+			SafeMode: config.PolicySafeModeFlag{
+				AllowRequestHeaderMutation:  true,
+				AllowResponseHeaderMutation: true,
+				AllowRedirectRewrite:        true,
+			},
+		},
 		Policies: []config.PolicyConfig{
 			{Name: "override", Action: "route_override", Parameters: map[string]string{"provider": "provider-b", "chain_mode": "continue"}},
 			{Name: "patch", Action: "headers_patch", Parameters: map[string]string{"X-Trace-ID": "trace-1", "Authorization": "nope", "traceparent": "00-abc"}, Selectors: map[string]string{"url_regex": "^http://svc\\.local/v1"}},
@@ -96,5 +103,96 @@ func TestEngineEvaluate_SizeAndTimeSelectors(t *testing.T) {
 	}, listeners.RouteDecision{Policy: "windowed"})
 	if decision.Action != ActionDeny {
 		t.Fatalf("expected deny action, got %q", decision.Action)
+	}
+}
+
+func TestEngineEvaluate_SafeModeDefaultsSuppressMutations(t *testing.T) {
+	t.Parallel()
+	cfg := &config.Config{
+		Policies: []config.PolicyConfig{
+			{Name: "req-patch", Action: ActionHeadersPatch, Parameters: map[string]string{"X-Guarded": "1"}},
+			{Name: "resp-patch", Action: ActionResponseHeadersPatch, Parameters: map[string]string{"X-Resp-Guarded": "1"}},
+			{Name: "redirect", Action: ActionRedirect, Parameters: map[string]string{"location": "https://example.com/new"}},
+			{Name: "rewrite", Action: ActionRewrite, Parameters: map[string]string{"host": "rewritten.local"}},
+			{Name: "body", Action: ActionBodyMutationHook, Parameters: map[string]string{"request_prefix": "safe"}},
+		},
+	}
+	engine := NewEngine(cfg)
+	req := httptest.NewRequest(http.MethodGet, "http://svc.local/v1", nil)
+
+	cases := []struct {
+		name         string
+		policy       string
+		suppression  string
+		tracePattern string
+	}{
+		{"request header patch", "req-patch", "request_header_mutation_guardrail", "req-patch:suppressed:request_header_mutation_guardrail"},
+		{"response header patch", "resp-patch", "response_header_mutation_guardrail", "resp-patch:suppressed:response_header_mutation_guardrail"},
+		{"redirect", "redirect", "redirect_rewrite_guardrail", "redirect:suppressed:redirect_rewrite_guardrail"},
+		{"rewrite", "rewrite", "redirect_rewrite_guardrail", "rewrite:suppressed:redirect_rewrite_guardrail"},
+		{"body", "body", "body_mutation_guardrail", "body:suppressed:body_mutation_guardrail"},
+	}
+
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			decision := engine.Evaluate(req, listeners.RequestMetadata{}, listeners.RouteDecision{Policy: tc.policy})
+			if decision.Action != ActionAllow {
+				t.Fatalf("expected allow when safe mode disabled, got %+v", decision)
+			}
+			if len(decision.Trace) == 0 || decision.Trace[0] != tc.tracePattern {
+				t.Fatalf("expected trace %q, got %+v", tc.tracePattern, decision.Trace)
+			}
+		})
+	}
+}
+
+func TestEngineEvaluate_SafeModeOptInAllowsMutations(t *testing.T) {
+	t.Parallel()
+	cfg := &config.Config{
+		PolicyEngine: config.PolicyEngineConfig{
+			ChainMode: "continue",
+			SafeMode: config.PolicySafeModeFlag{
+				AllowRequestHeaderMutation:  true,
+				AllowResponseHeaderMutation: true,
+				AllowRedirectRewrite:        true,
+				AllowBodyMutation:           true,
+			},
+		},
+		Policies: []config.PolicyConfig{
+			{Name: "req-patch", Action: ActionHeadersPatch, Parameters: map[string]string{"X-Guarded": "1"}},
+			{Name: "resp-patch", Action: ActionResponseHeadersPatch, Parameters: map[string]string{"X-Resp-Guarded": "1"}},
+			{Name: "redirect", Action: ActionRedirect, Parameters: map[string]string{"location": "https://example.com/new"}},
+			{Name: "rewrite", Action: ActionRewrite, Parameters: map[string]string{"host": "rewritten.local"}},
+			{Name: "body", Action: ActionBodyMutationHook, Parameters: map[string]string{"request_prefix": "safe"}},
+		},
+	}
+	engine := NewEngine(cfg)
+	req := httptest.NewRequest(http.MethodGet, "http://svc.local/v1", nil)
+
+	decision := engine.Evaluate(req, listeners.RequestMetadata{}, listeners.RouteDecision{Policy: "req-patch,resp-patch,rewrite,body"})
+	if decision.Action != ActionBodyMutationHook {
+		t.Fatalf("expected body mutation hook action, got %+v", decision)
+	}
+	if decision.HeadersPatch["X-Guarded"] != "1" {
+		t.Fatalf("expected request header patch, got %+v", decision.HeadersPatch)
+	}
+	if decision.ResponseHeadersPatch["X-Resp-Guarded"] != "1" {
+		t.Fatalf("expected response header patch, got %+v", decision.ResponseHeadersPatch)
+	}
+	if decision.RewriteHost != "rewritten.local" {
+		t.Fatalf("expected rewrite host, got %+v", decision)
+	}
+	if decision.RequestBodyPrefix != "safe" {
+		t.Fatalf("expected request body prefix, got %+v", decision)
+	}
+	for _, trace := range decision.Trace {
+		if trace == "req-patch:suppressed:request_header_mutation_guardrail" ||
+			trace == "resp-patch:suppressed:response_header_mutation_guardrail" ||
+			trace == "rewrite:suppressed:redirect_rewrite_guardrail" ||
+			trace == "body:suppressed:body_mutation_guardrail" {
+			t.Fatalf("did not expect suppression traces when safe mode is enabled: %+v", decision.Trace)
+		}
 	}
 }
