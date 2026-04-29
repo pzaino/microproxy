@@ -12,13 +12,17 @@ import (
 	"github.com/pzaino/microproxy/internal/dataplane"
 	"github.com/pzaino/microproxy/internal/dataplane/listeners"
 	"github.com/pzaino/microproxy/internal/dataplane/policy"
+	"github.com/pzaino/microproxy/internal/controlplane/runtimeapply"
 	"github.com/pzaino/microproxy/pkg/config"
 )
 
 type Handlers struct {
 	cfg           *config.Config
 	providerStore ProviderStateStore
+	resolver      *dataplane.RouteResolver
 	registry      *dataplane.ProviderRegistry
+	policyEngine  *policy.Engine
+	applyManager  *runtimeapply.Manager
 }
 
 func NewHandlers(cfg *config.Config) *Handlers {
@@ -37,11 +41,19 @@ func NewHandlers(cfg *config.Config) *Handlers {
 			Endpoint: providerCfg.Endpoints[0].URL,
 		})
 	}
-	return &Handlers{
+	h := &Handlers{
 		cfg:           cfg,
 		providerStore: store,
+		resolver:      dataplane.NewRouteResolver(cfg),
 		registry:      dataplane.NewProviderRegistry(cfg),
+		policyEngine:  policy.NewEngine(cfg),
 	}
+	h.applyManager = runtimeapply.New(cfg, providerStoreAdapter{store: store}, runtimeapply.RuntimeComponents{
+		Resolver:         &h.resolver,
+		ProviderRegistry: &h.registry,
+		PolicyEngine:     &h.policyEngine,
+	})
+	return h
 }
 
 func (h *Handlers) Health(rw http.ResponseWriter, _ *http.Request) {
@@ -165,7 +177,10 @@ func (h *Handlers) CreateProvider(rw http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	provider, err := h.providerStore.CreateProvider(payload.Provider)
+	provider, err := h.applyManager.ApplyProviderMutation(requestIDFromRequest(req), runtimeapply.ProviderMutation{
+		Op:   runtimeapply.OpCreateProvider,
+		Spec: toRuntimeApplySpec(payload.Provider),
+	})
 	if err != nil {
 		switch {
 		case errors.Is(err, ErrProviderExists):
@@ -176,7 +191,7 @@ func (h *Handlers) CreateProvider(rw http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	writeJSON(rw, http.StatusCreated, ProviderResponse{Provider: provider})
+	writeJSON(rw, http.StatusCreated, ProviderResponse{Provider: fromRuntimeApplyProvider(provider)})
 }
 
 func (h *Handlers) ReplaceProvider(rw http.ResponseWriter, req *http.Request) {
@@ -205,7 +220,12 @@ func (h *Handlers) ReplaceProvider(rw http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	provider, err := h.providerStore.ReplaceProvider(providerID, payload.ResourceVersion, payload.Provider)
+	provider, err := h.applyManager.ApplyProviderMutation(requestIDFromRequest(req), runtimeapply.ProviderMutation{
+		Op:              runtimeapply.OpReplaceProvider,
+		ProviderID:      providerID,
+		ExpectedVersion: payload.ResourceVersion,
+		Spec:            toRuntimeApplySpec(payload.Provider),
+	})
 	if err != nil {
 		switch {
 		case errors.Is(err, ErrProviderNotFound):
@@ -218,7 +238,7 @@ func (h *Handlers) ReplaceProvider(rw http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	writeJSON(rw, http.StatusOK, ProviderResponse{Provider: provider})
+	writeJSON(rw, http.StatusOK, ProviderResponse{Provider: fromRuntimeApplyProvider(provider)})
 }
 
 func (h *Handlers) PatchProvider(rw http.ResponseWriter, req *http.Request) {
@@ -246,7 +266,12 @@ func (h *Handlers) PatchProvider(rw http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	provider, err := h.providerStore.PatchProvider(providerID, payload.ResourceVersion, payload.Patch)
+	provider, err := h.applyManager.ApplyProviderMutation(requestIDFromRequest(req), runtimeapply.ProviderMutation{
+		Op:              runtimeapply.OpPatchProvider,
+		ProviderID:      providerID,
+		ExpectedVersion: payload.ResourceVersion,
+		Patch:           payload.Patch,
+	})
 	if err != nil {
 		switch {
 		case errors.Is(err, ErrProviderNotFound):
@@ -259,7 +284,7 @@ func (h *Handlers) PatchProvider(rw http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	writeJSON(rw, http.StatusOK, ProviderResponse{Provider: provider})
+	writeJSON(rw, http.StatusOK, ProviderResponse{Provider: fromRuntimeApplyProvider(provider)})
 }
 
 func (h *Handlers) DeleteProvider(rw http.ResponseWriter, req *http.Request) {
@@ -281,7 +306,11 @@ func (h *Handlers) DeleteProvider(rw http.ResponseWriter, req *http.Request) {
 		return
 	}
 
-	if err := h.providerStore.DeleteProvider(providerID, expectedVersion); err != nil {
+	if _, err := h.applyManager.ApplyProviderMutation(requestIDFromRequest(req), runtimeapply.ProviderMutation{
+		Op:              runtimeapply.OpDeleteProvider,
+		ProviderID:      providerID,
+		ExpectedVersion: expectedVersion,
+	}); err != nil {
 		switch {
 		case errors.Is(err, ErrProviderNotFound):
 			writeError(rw, http.StatusNotFound, "not_found", err.Error(), requestIDFromRequest(req))
@@ -412,4 +441,41 @@ func validateProviderPatch(patch map[string]any) error {
 
 func writeNoContent(rw http.ResponseWriter) {
 	rw.WriteHeader(http.StatusNoContent)
+}
+
+type providerStoreAdapter struct{ store ProviderStateStore }
+
+func (a providerStoreAdapter) ListProviders() []runtimeapply.Provider {
+	items := a.store.ListProviders()
+	out := make([]runtimeapply.Provider, 0, len(items))
+	for _, item := range items {
+		out = append(out, runtimeapply.Provider{ID: item.ID, ResourceVersion: item.ResourceVersion, Spec: toRuntimeApplySpec(item.Spec)})
+	}
+	return out
+}
+func (a providerStoreAdapter) CreateProvider(spec runtimeapply.ProviderSpec) (runtimeapply.Provider, error) {
+	p, err := a.store.CreateProvider(fromRuntimeApplySpec(spec))
+	return toRuntimeApplyProvider(p), err
+}
+func (a providerStoreAdapter) ReplaceProvider(id, expectedVersion string, spec runtimeapply.ProviderSpec) (runtimeapply.Provider, error) {
+	p, err := a.store.ReplaceProvider(id, expectedVersion, fromRuntimeApplySpec(spec))
+	return toRuntimeApplyProvider(p), err
+}
+func (a providerStoreAdapter) PatchProvider(id, expectedVersion string, patch map[string]any) (runtimeapply.Provider, error) {
+	p, err := a.store.PatchProvider(id, expectedVersion, patch)
+	return toRuntimeApplyProvider(p), err
+}
+func (a providerStoreAdapter) DeleteProvider(id, expectedVersion string) error { return a.store.DeleteProvider(id, expectedVersion) }
+
+func toRuntimeApplySpec(spec ProviderSpec) runtimeapply.ProviderSpec {
+	return runtimeapply.ProviderSpec{ID: spec.ID, Name: spec.Name, Type: spec.Type, Endpoint: spec.Endpoint}
+}
+func fromRuntimeApplySpec(spec runtimeapply.ProviderSpec) ProviderSpec {
+	return ProviderSpec{ID: spec.ID, Name: spec.Name, Type: spec.Type, Endpoint: spec.Endpoint}
+}
+func toRuntimeApplyProvider(p Provider) runtimeapply.Provider {
+	return runtimeapply.Provider{ID: p.ID, ResourceVersion: p.ResourceVersion, Spec: toRuntimeApplySpec(p.Spec)}
+}
+func fromRuntimeApplyProvider(p runtimeapply.Provider) Provider {
+	return Provider{ID: p.ID, ResourceVersion: p.ResourceVersion, Spec: fromRuntimeApplySpec(p.Spec)}
 }

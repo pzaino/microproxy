@@ -123,7 +123,7 @@ policies:
     type: header
     # action must be one of:
     # allow, deny, route_override, headers_patch, redirect, rewrite, response_headers_patch, body_mutation_hook
-    action: redirect # redact
+    action: redirect 
     selectors:
       phase: request
     parameters:
