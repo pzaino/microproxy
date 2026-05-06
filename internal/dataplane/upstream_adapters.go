@@ -75,7 +75,7 @@ type httpProxyAdapter struct {
 
 func (a httpProxyAdapter) PrepareRequest(req *http.Request, _ *url.URL) (*http.Request, error) {
 	out := req.Clone(req.Context())
-	applyProxyAuth(out.Header, a.auth)
+	applyProxyAuth(out.Header, a.auth, nil)
 	return out, nil
 }
 
@@ -101,7 +101,7 @@ func (a httpProxyAdapter) DialConnect(ctx context.Context, targetAddr string, en
 	}
 
 	connectHeaders := http.Header{}
-	applyProxyAuth(connectHeaders, a.auth)
+	applyProxyAuth(connectHeaders, a.auth, endpoint)
 	if err := writeConnect(conn, targetAddr, connectHeaders); err != nil {
 		_ = conn.Close()
 		return nil, err
@@ -177,8 +177,17 @@ func applyRequestAuth(headers http.Header, auth config.ProviderAuthConfig) {
 	}
 }
 
-func applyProxyAuth(headers http.Header, auth config.ProviderAuthConfig) {
-	switch strings.ToLower(strings.TrimSpace(auth.Type)) {
+func applyProxyAuth(headers http.Header, auth config.ProviderAuthConfig, endpoint *url.URL) {
+	authType := strings.ToLower(strings.TrimSpace(auth.Type))
+	if authType == "" || authType == "none" {
+		if endpoint != nil && endpoint.User != nil {
+			authType = "basic"
+			auth.Username = endpoint.User.Username()
+			auth.Password, _ = endpoint.User.Password()
+		}
+	}
+
+	switch authType {
 	case "basic":
 		credentials := auth.Username + ":" + auth.Password
 		headers.Set("Proxy-Authorization", "Basic "+base64.StdEncoding.EncodeToString([]byte(credentials)))
