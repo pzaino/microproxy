@@ -4,6 +4,8 @@
 .ds_store
 attic/
 do.patch
+controlplane.env
+config.yaml
 
 # old files
 *.old

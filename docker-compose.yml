@@ -1,0 +1,22 @@
+services:
+  microproxy:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: microproxy:local
+    container_name: microproxy
+    restart: unless-stopped
+    ports:
+      - "8080:8080" # downstream proxy listener
+      - "8081:8081" # control-plane API
+      - "9090:9090" # liveness
+      - "9091:9091" # metrics
+      - "9092:9092" # readiness
+      - "9093:9093" # startup
+    env_file:
+      - ./controlplane.env
+    environment:
+      MICROPROXY_DEVELOPMENT_MODE: "true"
+    volumes:
+      - ./config.yaml:/etc/microproxy/config.yaml:ro
+    command: ["-config", "/etc/microproxy/config.yaml", "-health-addr", ":9090"]
