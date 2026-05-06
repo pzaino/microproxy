@@ -1,19 +1,44 @@
 # syntax=docker/dockerfile:1.7
 
-# Build stage (using golang:1.26.2-alpine-3.22)
-FROM golang@sha256:7ef941168f213aa115df2e61364d67682129e99dc8188b734139dea862cc7d31 AS builder
+ARG GO_IMAGE=golang@sha256:7ef941168f213aa115df2e61364d67682129e99dc8188b734139dea862cc7d31
+ARG RUNTIME_IMAGE=gcr.io/distroless/static-debian12:nonroot
+
+FROM --platform=$BUILDPLATFORM ${GO_IMAGE} AS builder
 
 WORKDIR /src
+
+ARG TARGETOS
+ARG TARGETARCH
+ARG TARGETVARIANT
 
 RUN apk add --no-cache ca-certificates tzdata
 
 COPY go.mod go.sum ./
-RUN go mod download
+RUN --mount=type=cache,target=/go/pkg/mod \
+    go mod download
 
 COPY . .
-RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -ldflags='-s -w' -o /out/microproxy ./cmd/microproxy
 
-FROM gcr.io/distroless/static-debian12:nonroot
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    set -eux; \
+    goarm=""; \
+    if [ "${TARGETARCH}" = "arm" ]; then \
+      goarm="${TARGETVARIANT#v}"; \
+    fi; \
+    env \
+      CGO_ENABLED=0 \
+      GOOS="${TARGETOS:-linux}" \
+      GOARCH="${TARGETARCH:-amd64}" \
+      GOARM="${goarm}" \
+      go build \
+        -trimpath \
+        -ldflags='-s -w -buildid=' \
+        -o /out/microproxy \
+        ./cmd/microproxy
+
+FROM ${RUNTIME_IMAGE}
+
 WORKDIR /app
 
 COPY --from=builder /out/microproxy /usr/local/bin/microproxy
