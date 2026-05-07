@@ -7,12 +7,12 @@ services:
     container_name: microproxy
     restart: unless-stopped
     ports:
-      - "8080:8080" # downstream proxy listener
-      - "8081:8081" # control-plane API
-      - "9090:9090" # liveness
-      - "9091:9091" # metrics
-      - "9092:9092" # readiness
-      - "9093:9093" # startup
+      - "8084:8080" # downstream proxy listener
+      - "8085:8081" # control-plane API
+      - "8090:8090" # liveness
+      - "8091:8091" # metrics
+      - "8092:8092" # readiness
+      - "8093:8093" # startup
     env_file:
       - ./controlplane.env
     environment:

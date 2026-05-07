@@ -44,7 +44,5 @@ WORKDIR /app
 COPY --from=builder /out/microproxy /usr/local/bin/microproxy
 COPY --from=builder /src/config.yaml /etc/microproxy/config.yaml
 
-EXPOSE 8080 9090 9091 9092 9093 8081
-
 ENTRYPOINT ["/usr/local/bin/microproxy"]
 CMD ["-config", "/etc/microproxy/config.yaml", "-health-addr", ":9090"]
