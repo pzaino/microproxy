@@ -221,6 +221,10 @@ curl -i -H "X-API-Key: microproxy-controlplane-dev-key" http://127.0.0.1:8085/ap
 
 ---
 
+## Control-plane API guide
+
+For a detailed control-plane usage guide (endpoint catalog, auth/roles, and deployment model), see [controlplane.md](docs/controlplane.md).
+
 ## Contributing
 
 We welcome contributions. Please read [CONTRIBUTING.md](CONTRIBUTING.md).
