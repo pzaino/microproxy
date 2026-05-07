@@ -15,6 +15,7 @@ services:
       - "8093:8093" # startup
     env_file:
       - ./controlplane.env
+      #- ../thecrowler/.env
     environment:
       MICROPROXY_DEVELOPMENT_MODE: "true"
     volumes:

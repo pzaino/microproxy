@@ -346,6 +346,9 @@ func (c *Config) Load(file string) error {
 		return err
 	}
 
+	// Expand environment variables in the config file to allow dynamic values (e.g. secrets from env vars).
+	data = []byte(os.ExpandEnv(string(data)))
+
 	ext := filepath.Ext(file)
 	switch ext {
 	case ".json":
