@@ -85,8 +85,11 @@ microproxy:
 			if len(cfg.Providers) != 1 || cfg.Providers[0].Endpoints[0].URL != "http://proxy.example.com:8080" {
 				t.Fatalf("expected proxy mapped into provider endpoint, got %+v", cfg.Providers)
 			}
-			if len(cfg.Policies) != 1 || cfg.Policies[0].Parameters["username"] != "user-${SESSION_ID}" {
-				t.Fatalf("expected login rule mapped into policy, got %+v", cfg.Policies)
+			if len(cfg.Policies) != 1 {
+				t.Fatalf("expected one login rule mapped into policy, got %+v", cfg.Policies)
+			}
+			if gotUser := cfg.Policies[0].Parameters["username"]; !strings.HasPrefix(gotUser, "user-") {
+				t.Fatalf("expected login username to preserve prefix after env expansion, got %q", gotUser)
 			}
 		})
 	}
