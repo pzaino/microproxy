@@ -20,4 +20,4 @@ services:
       MICROPROXY_DEVELOPMENT_MODE: "true"
     volumes:
       - ./config.yaml:/etc/microproxy/config.yaml:ro
-    command: ["-config", "/etc/microproxy/config.yaml", "-health-addr", ":9090"]
+    command: ["-config", "/etc/microproxy/config.yaml", "-health-addr", ":8090"]
