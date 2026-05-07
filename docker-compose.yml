@@ -2,13 +2,12 @@ services:
   microproxy:
     build:
       context: .
-      dockerfile: Dockerfile
+      dockerfile: Dockerfile.mp
     image: microproxy:local
     container_name: microproxy
     restart: unless-stopped
     ports:
       - "8084:8080" # downstream proxy listener
-      - "8085:8081" # control-plane API
       - "8090:8090" # liveness
       - "8091:8091" # metrics
       - "8092:8092" # readiness
@@ -21,3 +20,18 @@ services:
     volumes:
       - ./config.yaml:/etc/microproxy/config.yaml:ro
     command: ["-config", "/etc/microproxy/config.yaml", "-health-addr", ":8090"]
+
+  microproxy-control:
+    build:
+      context: .
+      dockerfile: Dockerfile.mp-ctrl
+    image: microproxy-control:local
+    container_name: microproxy-control
+    env_file:
+      - ./controlplane.env
+      #- ../thecrowler/.env
+    ports:
+      - "8085:8081" # control-plane API
+    volumes:
+      - ./config.yaml:/etc/microproxy/config.yaml:ro
+    command: ["-config", "/etc/microproxy/config.yaml", "-listen-addr", ":8081"]
