@@ -1,0 +1,131 @@
+---
+
+name: Close Release
+
+permissions:
+  contents: write
+
+on:
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Dry run (do not push tag or create release)"
+        required: false
+        default: "false"
+      prerelease:
+        description: "Mark release as pre-release"
+        required: false
+        default: "false"
+
+jobs:
+  close-release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Harden the runner
+        uses: step-security/harden-runner@a5ad31d6a139d249332a2605b85202e8c0b78450 # v2.19.1
+        with:
+          egress-policy: audit
+
+      - name: Checkout repo
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+
+      - name: Read release version
+        id: get_version
+        run: |
+          set -euo pipefail
+
+          if [ ! -f RELEASE_VERSION.txt ]; then
+            echo "ERROR: RELEASE_VERSION.txt not found!"
+            exit 1
+          fi
+
+          VERSION="$(tr -d ' \n\r\t' < RELEASE_VERSION.txt)"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Release version: $VERSION"
+
+      - name: Validate version format
+        run: |
+          set -euo pipefail
+
+          VERSION="${{ steps.get_version.outputs.version }}"
+
+          if ! [[ "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "ERROR: Version must match vMAJOR.MINOR.PATCH, for example v1.2.3"
+            exit 1
+          fi
+
+      - name: Ensure tag does not already exist
+        run: |
+          set -euo pipefail
+
+          VERSION="${{ steps.get_version.outputs.version }}"
+
+          if git rev-parse "$VERSION" >/dev/null 2>&1; then
+            echo "ERROR: Tag $VERSION already exists!"
+            exit 1
+          fi
+
+      - name: Create Git tag
+        if: ${{ github.event.inputs.dry_run != 'true' }}
+        run: |
+          set -euo pipefail
+
+          VERSION="${{ steps.get_version.outputs.version }}"
+
+          git config user.name "github-actions"
+          git config user.email "actions@github.com"
+
+          git tag "$VERSION"
+          git push origin "$VERSION"
+
+      - name: Find previous tag
+        id: prev
+        run: |
+          set -euo pipefail
+
+          VERSION="${{ steps.get_version.outputs.version }}"
+
+          PREV="$(git describe --tags --abbrev=0 "${VERSION}^" 2>/dev/null || true)"
+          echo "prev_tag=$PREV" >> "$GITHUB_OUTPUT"
+
+          if [ -n "$PREV" ]; then
+            echo "Previous tag: $PREV"
+          else
+            echo "No previous tag found"
+          fi
+
+      - name: Create GitHub release
+        if: ${{ github.event.inputs.dry_run != 'true' }}
+        uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v3.0.0
+        with:
+          tag_name: ${{ steps.get_version.outputs.version }}
+          name: Release ${{ steps.get_version.outputs.version }}
+          body: |
+            Release ${{ steps.get_version.outputs.version }}
+
+            **Full Changelog**:
+            https://github.com/${{ github.repository }}/compare/${{ steps.prev.outputs.prev_tag }}...${{ steps.get_version.outputs.version }}
+          generate_release_notes: true
+          prerelease: ${{ github.event.inputs.prerelease }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Publish module version to Go proxy
+        if: ${{ github.event.inputs.dry_run != 'true' }}
+        run: |
+          set -euxo pipefail
+
+          VERSION="${{ steps.get_version.outputs.version }}"
+          MODULE="github.com/pzaino/microproxy"
+
+          curl -fsS "https://proxy.golang.org/${MODULE}/@v/${VERSION}.info" >/dev/null
+          curl -fsS "https://pkg.go.dev/${MODULE}@${VERSION}" >/dev/null || true
+
+      - name: Dry run notice
+        if: ${{ github.event.inputs.dry_run == 'true' }}
+        run: |
+          echo "[DRY RUN] Would have created Git tag and GitHub release for version ${{ steps.get_version.outputs.version }}"
+          

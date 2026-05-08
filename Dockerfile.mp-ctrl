@@ -12,14 +12,32 @@ ARG TARGETARCH
 ARG TARGETVARIANT
 
 COPY go.mod go.sum ./
-RUN go mod download
-COPY . .
-RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} GOARM=${TARGETVARIANT} go build -o /out/microproxy-control ./cmd/microproxy-control
+RUN --mount=type=cache,target=/go/pkg/mod \
+    go mod download
 
-FROM gcr.io/distroless/static-debian12:nonroot
+COPY . .
+
+RUN --mount=type=cache,target=/go/pkg/mod \
+    --mount=type=cache,target=/root/.cache/go-build \
+    set -eux; \
+    goarm=""; \
+    if [ "${TARGETARCH}" = "arm" ]; then \
+      goarm="${TARGETVARIANT#v}"; \
+    fi; \
+    env \
+      CGO_ENABLED=0 \
+      GOOS="${TARGETOS:-linux}" \
+      GOARCH="${TARGETARCH:-amd64}" \
+      GOARM="${goarm}" \
+      go build \
+        -trimpath \
+        -ldflags='-s -w -buildid=' \
+        -o /out/microproxy-control \
+        ./cmd/microproxy-control
+
+FROM ${RUNTIME_IMAGE}
 
 COPY --from=builder /out/microproxy-control /usr/local/bin/microproxy-control
 
 ENTRYPOINT ["/usr/local/bin/microproxy-control"]
-
 CMD ["-config", "/etc/microproxy/config.yaml", "-listen-addr", ":8081"]

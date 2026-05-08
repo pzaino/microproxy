@@ -1,0 +1,189 @@
+---
+
+name: Build and Push Images from Release
+
+permissions:
+  contents: read
+
+on:
+#  release:
+#    types:
+#      - published
+
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Git reference, tag, or branch to build from, for example main or v1.5.0"
+        required: true
+      dry_run:
+        description: "Dry run, build metadata only and do not push images"
+        required: false
+        default: "false"
+
+env:
+  REGISTRY: docker.io
+  IMAGE_OWNER: zfpsystems
+  DOCKER_BUILDKIT: 1
+  BUILDKIT_PROGRESS: plain
+  PLATFORMS: linux/amd64,linux/arm64
+
+jobs:
+  build-images:
+    runs-on: ubuntu-latest
+
+    strategy:
+      max-parallel: 2
+      fail-fast: false
+      matrix:
+        service:
+          - name: microproxy
+            dockerfile: Dockerfile.mp
+          - name: microproxy-control
+            dockerfile: Dockerfile.mp-ctrl
+
+    steps:
+      - name: Harden the runner
+        uses: step-security/harden-runner@a5ad31d6a139d249332a2605b85202e8c0b78450 # v2.19.1
+        with:
+          egress-policy: audit
+          allowed-endpoints: >
+            auth.docker.io:443
+            dl-cdn.alpinelinux.org:443
+            docker-images-prod.6aa30f8b08e16409b46e0173d6de2f56.r2.cloudflarestorage.com:443
+            docker.io:443
+            gcr.io:443
+            github.com:443
+            index.docker.io:443
+            production.cloudflare.docker.com:443
+            proxy.golang.org:443
+            registry-1.docker.io:443
+            storage.googleapis.com:443
+
+      - name: Resolve source ref
+        id: ref
+        run: |
+          set -euo pipefail
+
+          if [ "${{ github.event_name }}" = "release" ]; then
+            REF="${{ github.event.release.tag_name }}"
+            DRY_RUN="false"
+          else
+            REF="${{ github.event.inputs.release_tag }}"
+            DRY_RUN="${{ github.event.inputs.dry_run }}"
+          fi
+
+          echo "ref=$REF" >> "$GITHUB_OUTPUT"
+          echo "dry_run=$DRY_RUN" >> "$GITHUB_OUTPUT"
+
+          echo "Source ref: $REF"
+          echo "Dry run: $DRY_RUN"
+
+      - name: Checkout source ref
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          ref: ${{ steps.ref.outputs.ref }}
+
+      - name: Verify ref exists
+        run: |
+          set -euo pipefail
+
+          REF="${{ steps.ref.outputs.ref }}"
+
+          if ! git rev-parse "$REF" >/dev/null 2>&1; then
+            echo "ERROR: Ref $REF does not exist!"
+            exit 1
+          fi
+
+      - name: Validate Docker tag format
+        run: |
+          set -euo pipefail
+
+          TAG="${{ steps.ref.outputs.ref }}"
+
+          if ! [[ "$TAG" =~ ^[A-Za-z0-9_.-]+$ ]]; then
+            echo "ERROR: Docker tag must contain only letters, numbers, dots, underscores, or hyphens."
+            exit 1
+          fi
+
+          if [ "${#TAG}" -gt 128 ]; then
+            echo "ERROR: Docker tag must be 128 characters or fewer."
+            exit 1
+          fi
+
+      - name: Prepare config.yaml
+        run: |
+          set -euo pipefail
+
+          if [ -f config.yaml ]; then
+            echo "config.yaml already exists"
+            exit 0
+          fi
+
+          for candidate in \
+            config.default.remote \
+            config.default.yaml \
+            config.example.yaml \
+            examples/config.yaml
+          do
+            if [ -f "$candidate" ]; then
+              cp "$candidate" config.yaml
+              echo "Created config.yaml from $candidate"
+              exit 0
+            fi
+          done
+
+          echo "ERROR: config.yaml not found and no default config candidate exists."
+          echo "Dockerfile.mp copies config.yaml into the runtime image, so one must exist at build time."
+          exit 1
+
+      - name: Set up QEMU for cross-platform
+        uses: docker/setup-qemu-action@ce360397dd3f832beb865e1373c09c0e9f86d70a
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd
+        with:
+          use: true
+
+      - name: Log in to Docker Hub
+        if: ${{ steps.ref.outputs.dry_run != 'true' }}
+        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121
+        with:
+          username: ${{ secrets.DOCKER_USERNAME }}
+          password: ${{ secrets.DOCKER_PAT }}
+
+      - name: Build and push ${{ matrix.service.name }}
+        run: |
+          set -euo pipefail
+
+          TAG="${{ steps.ref.outputs.ref }}"
+          NAME="${{ matrix.service.name }}"
+          DOCKERFILE="${{ matrix.service.dockerfile }}"
+          IMAGE="$REGISTRY/$IMAGE_OWNER/$NAME"
+
+          echo "Image: $IMAGE"
+          echo "Tag: $TAG"
+          echo "Dockerfile: $DOCKERFILE"
+          echo "Platforms: $PLATFORMS"
+
+          if [ "${{ steps.ref.outputs.dry_run }}" = "true" ]; then
+            echo "[DRY RUN] Would build and push:"
+            echo "  $IMAGE:$TAG"
+            echo "  $IMAGE:latest"
+            echo "  platforms: $PLATFORMS"
+            exit 0
+          fi
+
+          docker buildx build \
+            --platform "$PLATFORMS" \
+            -f "$DOCKERFILE" \
+            --cache-from=type=registry,ref="$IMAGE:cache" \
+            --cache-to=type=registry,ref="$IMAGE:cache,mode=max" \
+            -t "$IMAGE:$TAG" \
+            -t "$IMAGE:latest" \
+            --push \
+            .
+
+      - name: Log out from Docker Hub
+        if: ${{ steps.ref.outputs.dry_run != 'true' }}
+        run: docker logout
