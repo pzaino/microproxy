@@ -38,6 +38,7 @@ RUN --mount=type=cache,target=/go/pkg/mod \
 FROM ${RUNTIME_IMAGE}
 
 COPY --from=builder /out/microproxy-control /usr/local/bin/microproxy-control
+COPY --from=builder /src/config.yaml /etc/microproxy/config.yaml
 
 ENTRYPOINT ["/usr/local/bin/microproxy-control"]
 CMD ["-config", "/etc/microproxy/config.yaml", "-listen-addr", ":8081"]
