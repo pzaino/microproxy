@@ -40,6 +40,9 @@ type Config struct {
 	PolicyEngine  PolicyEngineConfig  `json:"policy_engine,omitempty" yaml:"policy_engine,omitempty"`
 	Tenants       []TenantConfig      `json:"tenants" yaml:"tenants"`
 	Observability ObservabilityConfig `json:"observability" yaml:"observability"`
+	// SessionControl optionally enables the data-plane-local sticky session
+	// management API. Disabled by default for backward compatibility.
+	SessionControl SessionControlConfig `json:"session_control,omitempty" yaml:"session_control,omitempty"`
 
 	// Legacy config sections.
 	MicroProxy    ProxyConfig         `json:"microproxy" yaml:"microproxy"`
@@ -56,7 +59,12 @@ type ListenerConfig struct {
 	AuthType  string     `json:"auth_type,omitempty" yaml:"auth_type,omitempty"`
 	Username  string     `json:"username,omitempty" yaml:"username,omitempty"`
 	Password  string     `json:"password,omitempty" yaml:"password,omitempty"`
-	Enabled   bool       `json:"enabled" yaml:"enabled"`
+	// Provider optionally hard-binds a listener to a single upstream provider.
+	// When set, it is a mandatory egress constraint: routing rules, client
+	// headers and policy route overrides cannot escape it. Empty preserves
+	// legacy routing behaviour.
+	Provider  string `json:"provider,omitempty" yaml:"provider,omitempty"`
+	Enabled   bool   `json:"enabled" yaml:"enabled"`
 }
 
 type TLSConfig struct {
@@ -101,8 +109,22 @@ type ProviderRotationConfig struct {
 }
 
 type ProviderSessionConfig struct {
-	Supported        bool `json:"supported" yaml:"supported"`
-	RefreshSupported bool `json:"refresh_supported" yaml:"refresh_supported"`
+	Supported        bool   `json:"supported" yaml:"supported"`
+	RefreshSupported bool   `json:"refresh_supported" yaml:"refresh_supported"`
+	// Mode enables runtime session identity. Empty disables runtime
+	// sessions (metadata only). "username_template" enables per-request
+	// username rendering from a pinned session snapshot.
+	Mode string `json:"mode,omitempty" yaml:"mode,omitempty"`
+	// UsernameTemplate uses distinct {{username}} / {{session_id}} tokens.
+	// ${...} is NOT supported here because config loading expands env vars.
+	UsernameTemplate string `json:"username_template,omitempty" yaml:"username_template,omitempty"`
+}
+
+type SessionControlConfig struct {
+	Enabled     bool   `json:"enabled" yaml:"enabled"`
+	Address     string `json:"address,omitempty" yaml:"address,omitempty"`
+	BearerToken string `json:"bearer_token,omitempty" yaml:"bearer_token,omitempty"`
+	Provider    string `json:"provider,omitempty" yaml:"provider,omitempty"`
 }
 
 type ProviderGeoTargetingConfig struct {
@@ -457,6 +479,7 @@ func (c *Config) Validate() error {
 	}
 
 	listenerNameSeen := map[string]int{}
+	listenerAddrSeen := map[string]int{}
 	for idx, listener := range c.Listeners {
 		errs.Merge(listener.Validate(fmt.Sprintf("listeners[%d]", idx)))
 		if name := strings.TrimSpace(listener.Name); name != "" {
@@ -465,16 +488,34 @@ func (c *Config) Validate() error {
 			}
 			listenerNameSeen[name] = idx
 		}
+		if addr := strings.TrimSpace(listener.Address); addr != "" {
+			if seenIdx, exists := listenerAddrSeen[addr]; exists {
+				errs.Add(fmt.Sprintf("listeners[%d].address", idx), fmt.Sprintf("duplicates listeners[%d].address", seenIdx))
+			}
+			listenerAddrSeen[addr] = idx
+		}
 	}
 
 	providerNameSeen := map[string]int{}
+	providerByName := map[string]ProviderConfig{}
 	for idx, provider := range c.Providers {
 		errs.Merge(provider.Validate(fmt.Sprintf("providers[%d]", idx)))
 		if name := strings.TrimSpace(provider.Name); name != "" {
 			if seenIdx, exists := providerNameSeen[name]; exists {
 				errs.Add(fmt.Sprintf("providers[%d].name", idx), fmt.Sprintf("duplicates providers[%d].name", seenIdx))
+			} else {
+				providerByName[name] = provider
 			}
 			providerNameSeen[name] = idx
+		}
+	}
+
+	// Listener hard bindings must reference an existing provider.
+	for idx, listener := range c.Listeners {
+		if bound := strings.TrimSpace(listener.Provider); bound != "" {
+			if _, ok := providerNameSeen[bound]; !ok {
+				errs.Add(fmt.Sprintf("listeners[%d].provider", idx), "must reference an existing provider name")
+			}
 		}
 	}
 
@@ -503,6 +544,11 @@ func (c *Config) Validate() error {
 	errs.Merge(c.Routing.Validate("routing", providerNameSeen, policyNameSeen))
 	errs.Merge(c.PolicyEngine.Validate("policy_engine"))
 	errs.Merge(c.UpstreamProxy.Validate("upstream_proxy"))
+	errs.Merge(c.SessionControl.Validate("session_control", providerByName, c.Listeners, c.Observability))
+
+	// Bound listeners must not reference a route/policy that escapes the binding.
+	// Enforcement happens at runtime; validation ensures referenced providers exist
+	// (checked above) so a typo cannot silently fall back to direct egress.
 
 	return errs.OrNil()
 }
@@ -589,6 +635,7 @@ func (p ProviderConfig) Validate(fieldPath string) *ValidationErrors {
 
 	errs.Merge(p.Auth.Validate(fieldPath + ".auth"))
 	errs.Merge(p.Health.Validate(fieldPath + ".health"))
+	errs.Merge(p.Session.Validate(fieldPath+".session", p))
 	return errs
 }
 
@@ -825,4 +872,209 @@ func validateAddr(addr, field string) error {
 	}
 
 	return nil
+}
+
+// SessionEnabled reports whether a provider is explicitly configured for
+// runtime sticky-session identity (opt-in username templating).
+func (s ProviderSessionConfig) SessionEnabled() bool {
+	if !s.Supported {
+		return false
+	}
+	return strings.EqualFold(strings.TrimSpace(s.Mode), "username_template")
+}
+
+// Validate checks the opt-in session template contract. Provider type is
+// checked so unsupported upstreams reject session configuration explicitly.
+func (s ProviderSessionConfig) Validate(fieldPath string, provider ProviderConfig) *ValidationErrors {
+	errs := &ValidationErrors{}
+	mode := strings.TrimSpace(s.Mode)
+	template := s.UsernameTemplate
+	if mode == "" {
+		if strings.TrimSpace(template) != "" {
+			errs.Add(fieldPath+".username_template", "must be empty unless session mode is set")
+		}
+		if s.Supported && strings.TrimSpace(template) != "" {
+			errs.Add(fieldPath+".mode", "must be set when username_template is configured")
+		}
+		return errs
+	}
+	if !strings.EqualFold(mode, "username_template") {
+		errs.Add(fieldPath+".mode", "must be one of: username_template")
+		return errs
+	}
+	if !s.Supported {
+		errs.Add(fieldPath+".supported", "must be true when session mode is enabled")
+	}
+	if strings.TrimSpace(template) == "" {
+		errs.Add(fieldPath+".username_template", "is required when session mode is enabled")
+		return errs
+	}
+	if err := ValidateUsernameTemplate(template); err != nil {
+		errs.Add(fieldPath+".username_template", err.Error())
+	}
+	if !isHTTPSessionCapableProvider(provider) {
+		errs.Add(fieldPath+".mode", "username_template requires an http_proxy compatible provider type")
+	}
+	// Session identity requires basic upstream auth so the rendered username
+	// has a stable password to pair with.
+	if authType := strings.ToLower(strings.TrimSpace(provider.Auth.Type)); authType != "basic" {
+		errs.Add(fieldPath+".mode", "username_template requires provider auth type basic")
+	} else {
+		if strings.TrimSpace(provider.Auth.Username) == "" {
+			errs.Add(fieldPath+".mode", "username_template requires a base provider auth username without session suffix")
+		}
+		if strings.TrimSpace(provider.Auth.Password) == "" {
+			errs.Add(fieldPath+".mode", "username_template requires a provider auth password")
+		}
+		if strings.Contains(provider.Auth.Username, "{{") || strings.Contains(provider.Auth.Username, "}}") {
+			errs.Add(fieldPath+".mode", "base auth username must not contain template tokens")
+		}
+		if strings.Contains(provider.Auth.Username, "${") {
+			errs.Add(fieldPath+".mode", "base auth username must not contain ${ENV} placeholders; env expansion already ran")
+		}
+	}
+	return errs
+}
+
+// ValidateUsernameTemplate enforces exactly {{username}} and {{session_id}}
+// placeholders and rejects unknown substitutions or unsafe tokens.
+func ValidateUsernameTemplate(template string) error {
+	if strings.TrimSpace(template) == "" {
+		return fmt.Errorf("cannot be empty")
+	}
+	if !strings.Contains(template, "{{username}}") {
+		return fmt.Errorf("must contain {{username}}")
+	}
+	if !strings.Contains(template, "{{session_id}}") {
+		return fmt.Errorf("must contain {{session_id}}")
+	}
+	if strings.Contains(template, "${") {
+		return fmt.Errorf("must not contain ${ENV} placeholders; use {{username}} and {{session_id}} only")
+	}
+	// Reject any other {{...}} token.
+	rest := template
+	for {
+		start := strings.Index(rest, "{{")
+		if start < 0 {
+			break
+		}
+		end := strings.Index(rest[start:], "}}")
+		if end < 0 {
+			return fmt.Errorf("unbalanced template braces")
+		}
+		token := rest[start : start+end+2]
+		if token != "{{username}}" && token != "{{session_id}}" {
+			return fmt.Errorf("unsupported template token %q; only {{username}} and {{session_id}} are allowed", token)
+		}
+		rest = rest[start+end+2:]
+	}
+	if strings.Contains(rest, "}}") {
+		return fmt.Errorf("unbalanced template braces")
+	}
+	return nil
+}
+
+// RenderUsername composes an effective upstream username from base credentials
+// and a pinned session id. It is the single runtime template implementation.
+func RenderUsername(template, baseUsername, sessionID string) (string, error) {
+	if err := ValidateUsernameTemplate(template); err != nil {
+		return "", err
+	}
+	if strings.TrimSpace(baseUsername) == "" {
+		return "", fmt.Errorf("base username cannot be empty")
+	}
+	if strings.TrimSpace(sessionID) == "" {
+		return "", fmt.Errorf("session id cannot be empty")
+	}
+	out := strings.ReplaceAll(template, "{{username}}", baseUsername)
+	out = strings.ReplaceAll(out, "{{session_id}}", sessionID)
+	if strings.Contains(out, "{{") || strings.Contains(out, "}}") {
+		return "", fmt.Errorf("unresolved template tokens remain")
+	}
+	return out, nil
+}
+
+func isHTTPSessionCapableProvider(provider ProviderConfig) bool {
+	t := strings.ToLower(strings.TrimSpace(provider.Type))
+	switch t {
+	case "http_proxy", "https_proxy", "legacy_upstream_proxy":
+		return true
+	case "direct", "socks5_proxy":
+		return false
+	default:
+		for _, cap := range provider.Capabilities {
+			switch strings.ToLower(strings.TrimSpace(cap)) {
+			case "forward_proxy":
+				return true
+			case "direct", "socks5_proxy":
+				return false
+			}
+		}
+		// Unknown types default to http-compatible to preserve legacy
+		// behaviour unless they explicitly declare otherwise.
+		return true
+	}
+}
+
+// Validate enforces the data-plane-local session API contract.
+func (s SessionControlConfig) Validate(fieldPath string, providers map[string]ProviderConfig, listeners []ListenerConfig, obs ObservabilityConfig) *ValidationErrors {
+	errs := &ValidationErrors{}
+	if !s.Enabled {
+		// Disabled API must not carry secrets or bindings.
+		return errs
+	}
+	if strings.TrimSpace(s.Address) == "" {
+		errs.Add(fieldPath+".address", "is required when session_control is enabled")
+	} else if err := validateAddr(s.Address, fieldPath+".address"); err != nil {
+		errs.Add(fieldPath+".address", err.Error())
+	}
+	if strings.TrimSpace(s.BearerToken) == "" {
+		errs.Add(fieldPath+".bearer_token", "is required when session_control is enabled")
+	}
+	bound := strings.TrimSpace(s.Provider)
+	if bound == "" {
+		errs.Add(fieldPath+".provider", "is required when session_control is enabled")
+	} else if cfg, ok := providers[bound]; !ok {
+		errs.Add(fieldPath+".provider", "must reference an existing provider name")
+	} else if !cfg.Session.SessionEnabled() {
+		errs.Add(fieldPath+".provider", "must reference a provider with session mode username_template enabled")
+	}
+	// Port collisions with listeners and observability endpoints fail validation.
+	if port := portFromAddr(s.Address); port != 0 {
+		for idx, l := range listeners {
+			if !l.Enabled {
+				continue
+			}
+			if portFromAddr(l.Address) == port {
+				errs.Add(fieldPath+".address", fmt.Sprintf("port collides with listeners[%d].address", idx))
+			}
+		}
+		for _, addr := range []string{obs.Metrics.Address, obs.HealthEndpoints.LivenessAddress, obs.HealthEndpoints.ReadinessAddress, obs.HealthEndpoints.StartupAddress} {
+			if strings.TrimSpace(addr) != "" && portFromAddr(addr) == port {
+				errs.Add(fieldPath+".address", "port collides with an observability endpoint")
+				break
+			}
+		}
+	}
+	return errs
+}
+
+func portFromAddr(addr string) int {
+	addr = strings.TrimSpace(addr)
+	if addr == "" {
+		return 0
+	}
+	if _, portStr, err := net.SplitHostPort(addr); err == nil {
+		if port, perr := strconv.Atoi(strings.TrimSpace(portStr)); perr == nil {
+			return port
+		}
+		return 0
+	}
+	// Tolerate bare ":8094" style which SplitHostPort handles, and plain port.
+	if strings.HasPrefix(addr, ":") {
+		if port, perr := strconv.Atoi(strings.TrimSpace(strings.TrimPrefix(addr, ":"))); perr == nil {
+			return port
+		}
+	}
+	return 0
 }

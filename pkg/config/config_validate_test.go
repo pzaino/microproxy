@@ -152,6 +152,7 @@ func TestConfigExampleHasNoValidationErrors(t *testing.T) {
 	t.Setenv("MICROPROXY_LISTENER_PASSWORD", "listener-pass")
 	t.Setenv("MICROPROXY_HTTP_PROXY_USER", "proxy-user")
 	t.Setenv("MICROPROXY_HTTP_PROXY_PASSWORD", "proxy-pass")
+	t.Setenv("MICROPROXY_SESSION_API_KEY", "test-session-api-key")
 	cfg, err := LoadConfig("../../deploy/config.example.yaml")
 	if err != nil {
 		t.Fatalf("expected deploy/config.example.yaml to load cleanly, got: %v", err)

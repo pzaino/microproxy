@@ -69,6 +69,15 @@ func (m *CompositeListenerManager) Shutdown(ctx context.Context) error {
 	return errors.Join(errs...)
 }
 
+// CloseIdleConnections forwards to children that support it (HTTP listeners).
+func (m *CompositeListenerManager) CloseIdleConnections() {
+	for _, manager := range m.managers {
+		if closer, ok := manager.(interface{ CloseIdleConnections() }); ok {
+			closer.CloseIdleConnections()
+		}
+	}
+}
+
 // HTTPListenerManager owns one or more HTTP(S) data-plane listeners.
 type HTTPListenerManager struct {
 	drainTimeout time.Duration
@@ -90,6 +99,20 @@ type serverState struct {
 
 // NewListenerManager wires the runtime to concrete listener managers.
 func NewListenerManager(cfg *config.Config) ListenerManager {
+	manager, err := NewSessionManager(cfg)
+	if err != nil {
+		// Config validation should have rejected bad templates; fail safe
+		// with a noop manager rather than starting without identities.
+		// The explicit constructor below returns the error for callers that
+		// need it (e.g. microproxy main).
+		return NewListenerManagerWithError(manager, err)
+	}
+	return NewListenerManagerWithSessionManager(cfg, manager)
+}
+
+// NewListenerManagerWithSessionManager shares one live SessionManager between
+// the data-plane listeners and the session management API.
+func NewListenerManagerWithSessionManager(cfg *config.Config, manager *SessionManager) ListenerManager {
 	if cfg == nil {
 		return NoopListenerManager{}
 	}
@@ -109,7 +132,7 @@ func NewListenerManager(cfg *config.Config) ListenerManager {
 	}
 
 	managers := make([]ListenerManager, 0, 2)
-	runtime := NewRequestRuntime(cfg)
+	runtime := NewRequestRuntimeWithSessionManager(cfg, manager)
 	if len(httpListeners) > 0 {
 		managers = append(managers, NewHTTPListenerManager(httpListeners, defaultDrainTimeout, cfg.Observability.AccessLog.Enabled, runtime))
 	}
@@ -122,6 +145,20 @@ func NewListenerManager(cfg *config.Config) ListenerManager {
 	return NewCompositeListenerManager(managers...)
 }
 
+// errManager surfaces construction errors (e.g. RNG failure) as Start errors.
+type errManager struct{ err error }
+
+func (e errManager) Start(context.Context) error    { return e.err }
+func (e errManager) Shutdown(context.Context) error { return nil }
+
+// NewListenerManagerWithError returns a manager that fails Start with err.
+func NewListenerManagerWithError(_ *SessionManager, err error) ListenerManager {
+	if err == nil {
+		return NoopListenerManager{}
+	}
+	return errManager{err: err}
+}
+
 func NewHTTPListenerManager(listenerConfigs []config.ListenerConfig, drainTimeout time.Duration, accessLogEnabled bool, runtime listeners.RequestRuntime) *HTTPListenerManager {
 	if drainTimeout <= 0 {
 		drainTimeout = defaultDrainTimeout
@@ -131,7 +168,12 @@ func NewHTTPListenerManager(listenerConfigs []config.ListenerConfig, drainTimeou
 
 	states := make([]*serverState, 0, len(listenerConfigs))
 	for _, listenerCfg := range listenerConfigs {
-		baseChain := listeners.MetadataMiddleware(observability.HTTPMiddleware(proxyHandler, accessLogEnabled))
+		// Per-listener chain: auth -> metadata -> trusted binding -> observability -> handler.
+		// Binding is injected from server config, never from client headers.
+		bound := listenerCfg
+		inner := observability.HTTPMiddleware(proxyHandler, accessLogEnabled)
+		withBinding := listeners.ListenerBindingMiddleware(bound.Name, bound.Provider, inner)
+		baseChain := listeners.MetadataMiddleware(withBinding)
 		authChain := listeners.ListenerAuthMiddleware(listenerCfg.AuthType, listenerCfg.Username, listenerCfg.Password, baseChain)
 		server := &http.Server{
 			Addr:    listenerCfg.Address,
@@ -224,6 +266,16 @@ func (m *HTTPListenerManager) Shutdown(ctx context.Context) error {
 	}
 
 	return errors.Join(errs...)
+}
+
+// CloseIdleConnections drops pooled upstream idle connections so post-rotation
+// requests cannot reuse an old authenticated connection. Established CONNECT
+// tunnels are preserved.
+func (m *HTTPListenerManager) CloseIdleConnections() {
+	if m == nil || m.handler == nil {
+		return
+	}
+	m.handler.CloseIdleConnections()
 }
 
 func (s *serverState) connState(conn net.Conn, state http.ConnState) {

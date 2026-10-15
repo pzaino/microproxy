@@ -21,6 +21,11 @@ import (
 type upstreamAdapterFactory struct{}
 
 func (upstreamAdapterFactory) ForProvider(provider config.ProviderConfig) listeners.UpstreamAdapter {
+	sessionEnabled := provider.Session.SessionEnabled()
+	sessionTemplate := ""
+	if sessionEnabled {
+		sessionTemplate = provider.Session.UsernameTemplate
+	}
 	t := strings.ToLower(strings.TrimSpace(provider.Type))
 	switch t {
 	case "direct":
@@ -28,7 +33,7 @@ func (upstreamAdapterFactory) ForProvider(provider config.ProviderConfig) listen
 	case "socks5_proxy":
 		return socks5ProxyAdapter{auth: provider.Auth}
 	case "http_proxy", "https_proxy", "legacy_upstream_proxy":
-		return httpProxyAdapter{auth: provider.Auth}
+		return httpProxyAdapter{providerName: strings.TrimSpace(provider.Name), auth: provider.Auth, sessionTemplate: sessionTemplate, sessionEnabled: sessionEnabled}
 	default:
 		for _, capability := range provider.Capabilities {
 			switch strings.ToLower(strings.TrimSpace(capability)) {
@@ -37,10 +42,10 @@ func (upstreamAdapterFactory) ForProvider(provider config.ProviderConfig) listen
 			case "socks5_proxy":
 				return socks5ProxyAdapter{auth: provider.Auth}
 			case "forward_proxy":
-				return httpProxyAdapter{auth: provider.Auth}
+				return httpProxyAdapter{providerName: strings.TrimSpace(provider.Name), auth: provider.Auth, sessionTemplate: sessionTemplate, sessionEnabled: sessionEnabled}
 			}
 		}
-		return httpProxyAdapter{auth: provider.Auth}
+		return httpProxyAdapter{providerName: strings.TrimSpace(provider.Name), auth: provider.Auth, sessionTemplate: sessionTemplate, sessionEnabled: sessionEnabled}
 	}
 }
 
@@ -70,12 +75,46 @@ func (a directAdapter) RotateIdentity(context.Context) error {
 func (a directAdapter) Capabilities() []string { return []string{"forward", "connect"} }
 
 type httpProxyAdapter struct {
-	auth config.ProviderAuthConfig
+	providerName    string
+	auth            config.ProviderAuthConfig
+	sessionTemplate string
+	sessionEnabled  bool
 }
 
-func (a httpProxyAdapter) PrepareRequest(req *http.Request, _ *url.URL) (*http.Request, error) {
+func (a httpProxyAdapter) effectiveCredentials(ctx context.Context, endpoint *url.URL) (string, string) {
+	username := a.auth.Username
+	password := a.auth.Password
+	if a.sessionEnabled {
+		if snapshot, ok := listeners.SessionSnapshotFromContext(ctx); ok {
+			if snapshot.Provider == a.providerName || a.providerName == "" {
+				if rendered, err := config.RenderUsername(a.sessionTemplate, a.auth.Username, snapshot.SessionID); err == nil {
+					username = rendered
+				}
+			}
+		}
+	}
+	// Preserve endpoint-userinfo fallback for non-session static auth.
+	if strings.TrimSpace(a.auth.Type) == "" || strings.EqualFold(strings.TrimSpace(a.auth.Type), "none") {
+		if strings.TrimSpace(username) == "" && endpoint != nil && endpoint.User != nil {
+			username = endpoint.User.Username()
+			password, _ = endpoint.User.Password()
+		}
+	}
+	return username, password
+}
+
+func (a httpProxyAdapter) PrepareRequest(req *http.Request, endpoint *url.URL) (*http.Request, error) {
 	out := req.Clone(req.Context())
-	applyProxyAuth(out.Header, a.auth, nil)
+	username, password := a.effectiveCredentials(req.Context(), endpoint)
+	effective := a.auth
+	effective.Username = username
+	effective.Password = password
+	// When session is enabled the rendered username must be used even if the
+	// base auth type was basic; force basic rendering path.
+	if a.sessionEnabled && strings.TrimSpace(username) != "" {
+		effective.Type = "basic"
+	}
+	applyProxyAuth(out.Header, effective, nil)
 	return out, nil
 }
 
@@ -101,7 +140,14 @@ func (a httpProxyAdapter) DialConnect(ctx context.Context, targetAddr string, en
 	}
 
 	connectHeaders := http.Header{}
-	applyProxyAuth(connectHeaders, a.auth, endpoint)
+	username, password := a.effectiveCredentials(ctx, endpoint)
+	effective := a.auth
+	effective.Username = username
+	effective.Password = password
+	if a.sessionEnabled && strings.TrimSpace(username) != "" {
+		effective.Type = "basic"
+	}
+	applyProxyAuth(connectHeaders, effective, endpoint)
 	if err := writeConnect(conn, targetAddr, connectHeaders); err != nil {
 		_ = conn.Close()
 		return nil, err
@@ -125,6 +171,15 @@ func (a httpProxyAdapter) RoundTrip(req *http.Request, endpoint *url.URL, transp
 	cloned := transport.Clone()
 	cloned.Proxy = http.ProxyURL(endpoint)
 	cloned.ResponseHeaderTimeout = responseHeaderTimeout
+	if a.sessionEnabled {
+		// Prevent accidental reuse of an old authenticated upstream connection
+		// after rotation. Each sticky request gets a fresh TCP connection to
+		// the upstream proxy; the per-request Proxy-Authorization header
+		// already carries the pinned session identity.
+		cloned.DisableKeepAlives = true
+		cloned.MaxIdleConnsPerHost = 0
+		cloned.IdleConnTimeout = 0
+	}
 	return cloned.RoundTrip(req)
 }
 

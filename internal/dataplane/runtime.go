@@ -67,13 +67,35 @@ const (
 )
 
 func NewRequestRuntime(cfg *config.Config) listeners.RequestRuntime {
+	runtime, _ := NewRequestRuntimeE(cfg)
+	return runtime
+}
+
+// NewRequestRuntimeE builds the request runtime plus the shared session manager.
+// It returns an error when sticky-session identities cannot be generated.
+func NewRequestRuntimeE(cfg *config.Config) (listeners.RequestRuntime, error) {
+	manager, err := NewSessionManager(cfg)
+	if err != nil {
+		return listeners.RequestRuntime{}, err
+	}
+	return NewRequestRuntimeWithSessionManager(cfg, manager), nil
+}
+
+// NewRequestRuntimeWithSessionManager builds a runtime sharing the given live
+// session manager instance (same process, same identities as the management API).
+func NewRequestRuntimeWithSessionManager(cfg *config.Config, manager *SessionManager) listeners.RequestRuntime {
 	registry := NewProviderRegistry(cfg)
+	var sessions listeners.SessionSnapshotProvider
+	if manager != nil {
+		sessions = manager
+	}
 	return listeners.RequestRuntime{
 		Resolver:          NewRouteResolver(cfg),
 		Registry:          registry,
 		Selector:          NewEndpointSelector(registry),
 		ClassifyTimeoutFn: ClassifyTimeout,
 		PolicyEvaluator:   policy.NewEngine(cfg),
+		Sessions:          sessions,
 	}
 }
 

@@ -3,18 +3,38 @@
 # This file is intentionally a single valid config plus explicit scenario blocks.
 # Copy one scenario block at a time (single provider / failover / selenium downstream)
 # into the active sections below when building environment-specific configs.
+#
+# Sticky-session profile (VDI):
+#   :8080 edge-http        -> rotating provider (unchanged behaviour)
+#   :8081 edge-http-sticky -> sticky provider (session-managed, one logical
+#                            session per microproxy process)
+#   127.0.0.1:8094        -> authenticated data-plane session management API
+# CROWler contract: close old browser -> POST /api/v1/sessions/rotate
+#   with Idempotency-Key -> wait for 200 -> start next browser.
 
 schema_version: "1"
 
 # listeners: ingress interfaces that accept downstream client traffic.
+# `provider` (optional) hard-binds a listener to one upstream provider. When
+# set it is a mandatory egress constraint: X-Provider-ID, routing rules and
+# policy route_override cannot escape it. Empty preserves legacy routing.
 listeners:
   - name: edge-http
     type: http
     address: 0.0.0.0:8080
+    provider: corp-http-primary
     rate_limit: 500
     auth_type: basic
     username: ${MICROPROXY_LISTENER_USER}
     password: ${MICROPROXY_LISTENER_PASSWORD}
+    enabled: true
+
+  - name: edge-http-sticky
+    type: http
+    address: 0.0.0.0:8081
+    provider: corp-http-sticky
+    rate_limit: 500
+    auth_type: none
     enabled: true
 
 providers:
@@ -56,6 +76,26 @@ providers:
       interval_seconds: 15
       timeout_seconds: 2
       failure_threshold: 3
+
+  - name: corp-http-sticky
+    type: http_proxy
+    auth:
+      type: basic
+      # Base username WITHOUT a session suffix. The runtime renders
+      # "{{username}}-session-{{session_id}}" per pinned identity.
+      username: ${MICROPROXY_HTTP_PROXY_USER}
+      password: ${MICROPROXY_HTTP_PROXY_PASSWORD}
+    session:
+      supported: true
+      mode: username_template
+      username_template: "{{username}}-session-{{session_id}}"
+    endpoints:
+      - url: http://proxy-a.internal:3128
+        priority: 100
+        weight: 1
+    capabilities: ["forward_proxy"]
+    health:
+      enabled: false
 
 routing:
   default_provider: corp-http-primary
@@ -142,6 +182,21 @@ tenants:
     id: tenant-selenium
     providers: [corp-http-primary]
     policies: [allow-default]
+  - name: tenant-sticky
+    id: tenant-sticky
+    providers: [corp-http-sticky]
+    policies: [allow-default]
+
+# session_control: data-plane-local sticky session management API.
+# Disabled by default; enable only with a strong bearer token and loopback
+# (or private-network) binding. It rotates the SAME process that serves :8081.
+# microproxy-control provider rotation stubs are a separate contract and do not
+# mutate this runtime.
+session_control:
+  enabled: true
+  address: 127.0.0.1:8094
+  bearer_token: ${MICROPROXY_SESSION_API_KEY}
+  provider: corp-http-sticky
 
 observability:
   access_log:
@@ -172,3 +227,11 @@ observability:
 #   listeners[0].auth_type: none
 #   listeners[0].username/password: removed
 #   providers[*].auth: keep upstream auth enabled
+#
+# sticky-vdi:
+#   listeners: edge-http (:8080, provider proxyservice-residential) +
+#              edge-http-sticky (:8081, provider proxyservice-residential-sticky, auth none)
+#   providers: proxyservice-residential (static basic) +
+#              proxyservice-residential-sticky (session mode username_template)
+#   session_control: 127.0.0.1:8094, bearer ${MICROPROXY_SESSION_API_KEY}
+#   CROWler: close browser -> POST rotate (Idempotency-Key) -> 200 -> start browser

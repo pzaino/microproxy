@@ -106,7 +106,7 @@ func (m *SOCKS5ListenerManager) handleSOCKS5Connection(clientConn net.Conn, list
 		return
 	}
 
-	targetConn, err := m.dialSOCKS5Target(clientConn, req.Target)
+	targetConn, err := m.dialSOCKS5Target(clientConn, req.Target, listenerCfg)
 	if err != nil {
 		_ = listeners.WriteSOCKS5ConnectReply(clientConn, 0x05, nil)
 		return
@@ -120,8 +120,46 @@ func (m *SOCKS5ListenerManager) handleSOCKS5Connection(clientConn net.Conn, list
 	tunnelConns(clientConn, targetConn)
 }
 
-func (m *SOCKS5ListenerManager) dialSOCKS5Target(clientConn net.Conn, targetAddr string) (net.Conn, error) {
+func (m *SOCKS5ListenerManager) dialSOCKS5Target(clientConn net.Conn, targetAddr string, listenerCfg config.ListenerConfig) (net.Conn, error) {
 	ctx := context.Background()
+	boundProvider := strings.TrimSpace(listenerCfg.Provider)
+	// Hard binding wins; fail closed when no resolver/registry can satisfy it.
+	if boundProvider != "" {
+		if m.runtime.Registry == nil {
+			return nil, fmt.Errorf("no upstream endpoints available for required provider %q", boundProvider)
+		}
+		provider, ok := m.runtime.Registry.Get(boundProvider)
+		if !ok {
+			return nil, fmt.Errorf("provider %q not found", boundProvider)
+		}
+		req := (&http.Request{Method: http.MethodConnect, Host: targetAddr, URL: &url.URL{Host: targetAddr}}).WithContext(ctx)
+		endpoints := provider.Endpoints
+		if m.runtime.Selector != nil {
+			endpoints = m.runtime.Selector.Select(ctx, provider, req)
+		}
+		if len(endpoints) == 0 {
+			return nil, fmt.Errorf("no upstream endpoints available for required provider %q", boundProvider)
+		}
+		// Pin session snapshot for SOCKS5 CONNECT when available.
+		if m.runtime.Sessions != nil {
+			if snapshot, ok := m.runtime.Sessions.Snapshot(boundProvider); ok {
+				ctx = listeners.WithSessionSnapshot(ctx, snapshot)
+			}
+		}
+		var errs []error
+		for _, endpoint := range endpoints {
+			adapter := endpoint.Adapter
+			if adapter == nil {
+				return nil, fmt.Errorf("no upstream adapter available for required provider %q", boundProvider)
+			}
+			conn, err := adapter.DialConnect(ctx, targetAddr, endpoint.URL, m.dialer)
+			if err == nil {
+				return conn, nil
+			}
+			errs = append(errs, err)
+		}
+		return nil, errors.Join(errs...)
+	}
 	if m.runtime.Resolver == nil {
 		return m.dialer.DialContext(ctx, "tcp", targetAddr)
 	}
@@ -133,6 +171,7 @@ func (m *SOCKS5ListenerManager) dialSOCKS5Target(clientConn net.Conn, targetAddr
 		return nil, err
 	}
 	if decision.Provider == "" || m.runtime.Registry == nil {
+		// Legacy direct path preserved only when no provider is required.
 		return m.dialer.DialContext(ctx, "tcp", targetAddr)
 	}
 
@@ -146,14 +185,19 @@ func (m *SOCKS5ListenerManager) dialSOCKS5Target(clientConn net.Conn, targetAddr
 		endpoints = m.runtime.Selector.Select(ctx, provider, req)
 	}
 	if len(endpoints) == 0 {
-		return m.dialer.DialContext(ctx, "tcp", targetAddr)
+		return nil, fmt.Errorf("no upstream endpoints available for required provider %q", decision.Provider)
+	}
+	if m.runtime.Sessions != nil {
+		if snapshot, ok := m.runtime.Sessions.Snapshot(decision.Provider); ok {
+			ctx = listeners.WithSessionSnapshot(ctx, snapshot)
+		}
 	}
 
 	var errs []error
 	for _, endpoint := range endpoints {
 		adapter := endpoint.Adapter
 		if adapter == nil {
-			adapter = directAdapter{}
+			return nil, fmt.Errorf("no upstream adapter available for required provider %q", decision.Provider)
 		}
 		conn, err := adapter.DialConnect(ctx, targetAddr, endpoint.URL, m.dialer)
 		if err == nil {

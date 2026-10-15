@@ -1,0 +1,136 @@
+openapi: 3.1.0
+info:
+  title: MicroProxy Data-Plane Session Control API
+  version: 1.0.0
+  description: |
+    local authenticated API served by the running `microproxy` data-plane
+    process (default 127.0.0.1:8094). Distinct from the `microproxy-control`
+    control-plane contract in api/controlplane.openapi.yaml, whose provider
+    rotate/refresh routes are async stubs and do not mutate data-plane sticky
+    identity.
+servers:
+  - url: http://127.0.0.1:8094
+paths:
+  /api/v1/sessions/rotate:
+    post:
+      summary: Rotate sticky upstream session
+      operationId: rotateStickySession
+      description: |
+        Atomically commits a new upstream proxy sticky/persistent-session identity 
+        for the configured provider. New HTTP requests and CONNECT tunnels starting
+        after the commit use the new credentials; established tunnels are
+        preserved. Caller must close the old browser before calling and start
+        the next browser only after 200.
+      parameters:
+        - name: Authorization
+          in: header
+          required: true
+          schema:
+            type: string
+          description: Bearer <MICROPROXY_SESSION_API_KEY>
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 256
+          description: Unique caller job-boundary id. Replay returns prior generation.
+      responses:
+        '200':
+          description: Rotated (or replayed) identity committed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RotateResponse'
+        '400':
+          description: Malformed request or idempotency key.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '401':
+          description: Missing or invalid bearer credentials.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '405':
+          description: Method must be POST.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '503':
+          description: Identity generation failed; previous state preserved.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+  /api/v1/sessions/status:
+    get:
+      summary: Sticky/persistent session status
+      operationId: getStickySessionStatus
+      description: Authenticated provider/generation only; never exposes identity.
+      parameters:
+        - name: Authorization
+          in: header
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Current generation.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StatusResponse'
+        '401':
+          description: Missing or invalid bearer credentials.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '405':
+          description: Method must be GET.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+components:
+  schemas:
+    RotateResponse:
+      type: object
+      required: [status, provider, generation]
+      properties:
+        status:
+          type: string
+          example: rotated
+        provider:
+          type: string
+          example: proxyservice-residential-sticky
+        generation:
+          type: integer
+          format: int64
+          example: 2
+    StatusResponse:
+      type: object
+      required: [provider, generation]
+      properties:
+        provider:
+          type: string
+        generation:
+          type: integer
+          format: int64
+    ErrorEnvelope:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code:
+              type: string
+            message:
+              type: string

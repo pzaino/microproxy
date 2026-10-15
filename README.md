@@ -4,8 +4,8 @@ MicroProxy provides a **data-plane proxy** (`microproxy`) plus a **control-plane
 
 ## What you run
 
-- `microproxy`: serves downstream proxy listeners from `config.yaml` and exposes observability/health endpoints.
-- `microproxy-control`: serves the control-plane HTTP API (default `:8081`) and uses `controlplane.env` for authentication.
+- `microproxy`: serves downstream proxy listeners from `config.yaml` and exposes observability/health endpoints. VDI profile: `:8080` rotating, `:8081` sticky, `127.0.0.1:8094` session management API (see `docs/session-control.md`).
+- `microproxy-control`: serves the control-plane HTTP API (default `:8081` standalone; use a different port such as `:8085` when co-located with the sticky `:8081` data-plane listener) and uses `controlplane.env` for authentication. Its provider rotate/refresh routes are contract stubs and do not mutate data-plane sticky identity.
 
 ---
 
@@ -39,14 +39,15 @@ cp deploy/config.example.yaml ./config.yaml
 
 Important fields to review in `config.yaml`:
 
-- `listeners[]`: downstream interfaces (`type`, `address`, auth settings).
-- `providers[]`: upstream proxies + health checks.
+- `listeners[]`: downstream interfaces (`type`, `address`, auth settings, optional hard `provider` binding).
+- `providers[]`: upstream proxies + health checks (`session.mode: username_template` for sticky).
 - `routing`: default provider and routing rules by tenant/host.
 - `policies`: allow/deny/header policies.
 - `tenants`: tenant-to-provider/policy binding.
+- `session_control`: VDI-local sticky rotation API (`127.0.0.1:8094`, bearer token, sticky provider).
 - `observability.health_endpoints`: liveness/readiness/startup ports.
 
-> Tip: the example already includes single-provider, failover, and selenium-friendly scenarios as documented snippets.
+> Tip: the example already includes single-provider, failover, and selenium-friendly scenarios as documented snippets, plus an active sticky VDI profile (`:8080`/`:8081`/`8094`).
 
 ### `controlplane.env`
 
@@ -224,6 +225,25 @@ curl -i -H "X-API-Key: microproxy-controlplane-dev-key" http://127.0.0.1:8085/ap
 ## Control-plane API guide
 
 For a detailed control-plane usage guide (endpoint catalog, auth/roles, and deployment model), see [controlplane.md](docs/controlplane.md).
+
+## Sticky/persistent-session rotation guide
+
+Microproxy allows the use of a sticky/persistent profile which can be mapped to different ports, e.g., `:8080` rotating, `:8081` sticky, and have a rotation request sent to `127.0.0.1:8094` rotation API., see [session-control.md](docs/session-control.md) and `api/session-control.openapi.yaml` for more details.
+
+This function (when supported by the upstream proxy) allows rotating of a proxy session on demand without restarting the proxy.
+
+Rotate without restart:
+
+```bash
+curl -sS -X POST http://127.0.0.1:8094/api/v1/sessions/rotate \
+  -H "Authorization: Bearer ${MICROPROXY_SESSION_API_KEY}" \
+  -H "Idempotency-Key: <unique-job-id>"
+# {"status":"rotated","provider":"corp-http-sticky","generation":2}
+```
+
+Persistent sessions can help maintain a consistent identity or connection state with the upstream proxy, which is useful for scenarios requiring session affinity or long-lived connections.
+
+> Please note: Persistent sessions rely on the upstream proxy's support for session affinity. If the upstream proxy does not support sticky sessions, the rotation mechanism may not function as expected.
 
 ## Contributing
 
