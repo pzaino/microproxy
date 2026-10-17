@@ -1116,13 +1116,14 @@ func (o ObservabilityConfig) Validate(fieldPath string) *ValidationErrors {
 	return errs
 }
 
-// validateBindConflicts rejects two enabled endpoints that compete for the
-// same TCP port. Port 0 is intentionally ignored because the kernel assigns a
-// distinct ephemeral port to each listener.
+// validateBindConflicts rejects overlapping TCP listeners, except observability
+// routes configured at exactly the same address: these share one HTTP server.
+// Port 0 is ignored because the kernel assigns an ephemeral port to each server.
 func (c *Config) validateBindConflicts() *ValidationErrors {
 	type bindEndpoint struct {
-		field   string
-		address string
+		field         string
+		address       string
+		observability bool
 	}
 	errs := &ValidationErrors{}
 	endpoints := make([]bindEndpoint, 0, len(c.Listeners)+5)
@@ -1135,26 +1136,55 @@ func (c *Config) validateBindConflicts() *ValidationErrors {
 		endpoints = append(endpoints, bindEndpoint{field: "session_control.address", address: c.SessionControl.Address})
 	}
 	if c.Observability.Metrics.Enabled {
-		endpoints = append(endpoints, bindEndpoint{field: "observability.metrics.address", address: c.Observability.Metrics.Address})
+		endpoints = append(endpoints, bindEndpoint{field: "observability.metrics.address", address: c.Observability.Metrics.Address, observability: true})
 	}
 	endpoints = append(endpoints,
-		bindEndpoint{field: "observability.health_endpoints.liveness_address", address: c.Observability.HealthEndpoints.LivenessAddress},
-		bindEndpoint{field: "observability.health_endpoints.readiness_address", address: c.Observability.HealthEndpoints.ReadinessAddress},
-		bindEndpoint{field: "observability.health_endpoints.startup_address", address: c.Observability.HealthEndpoints.StartupAddress},
+		bindEndpoint{field: "observability.health_endpoints.liveness_address", address: c.Observability.HealthEndpoints.LivenessAddress, observability: true},
+		bindEndpoint{field: "observability.health_endpoints.readiness_address", address: c.Observability.HealthEndpoints.ReadinessAddress, observability: true},
+		bindEndpoint{field: "observability.health_endpoints.startup_address", address: c.Observability.HealthEndpoints.StartupAddress, observability: true},
 	)
-	seen := map[int]bindEndpoint{}
-	for _, endpoint := range endpoints {
+	for i, endpoint := range endpoints {
 		port := portFromAddr(endpoint.address)
 		if port == 0 {
 			continue
 		}
-		if previous, exists := seen[port]; exists {
+		for _, previous := range endpoints[:i] {
+			if port != portFromAddr(previous.address) {
+				continue
+			}
+			// The observability manager groups handlers by the exact address
+			// string, not just by TCP port.
+			if endpoint.observability && previous.observability && endpoint.address == previous.address {
+				continue
+			}
+			if !bindAddressesOverlap(endpoint.address, previous.address) {
+				continue
+			}
 			errs.Add(endpoint.field, fmt.Sprintf("port %d conflicts with %s (%q)", port, previous.field, previous.address))
-			continue
+			break
 		}
-		seen[port] = endpoint
 	}
 	return errs
+}
+
+// bindAddressesOverlap is used only for equal, nonzero TCP ports. Distinct
+// literal IP addresses can bind separately. Unspecified addresses overlap
+// all local addresses; unresolved hostnames are conservatively assumed to
+// overlap, as dual-stack and name resolution are system dependent.
+func bindAddressesOverlap(a, b string) bool {
+	hostA, _, errA := net.SplitHostPort(strings.TrimSpace(a))
+	hostB, _, errB := net.SplitHostPort(strings.TrimSpace(b))
+	if errA != nil || errB != nil || strings.EqualFold(hostA, hostB) {
+		return true
+	}
+	ipA, ipB := net.ParseIP(hostA), net.ParseIP(hostB)
+	if hostA == "" || hostB == "" || ipA == nil || ipB == nil {
+		return true
+	}
+	if ipA.IsUnspecified() || ipB.IsUnspecified() {
+		return true
+	}
+	return ipA.Equal(ipB)
 }
 
 func isLoopbackAddress(addr string) bool {

@@ -69,18 +69,25 @@ func TestApplyHealthAddressOverride_RejectsInvalidAddress(t *testing.T) {
 }
 
 func TestApplyHealthAddressOverride_RejectsConflicts(t *testing.T) {
+	// The health server cannot share a socket with an independent proxy server.
+	cfg := healthTestConfig()
+	cfg.Listeners = append(cfg.Listeners, config.ListenerConfig{
+		Name: "edge-extra", Type: "http", Address: "127.0.0.1:9393", AuthType: "none", Enabled: true,
+	})
+	err := applyHealthAddressOverride(cfg, "127.0.0.1:9393")
+	if err == nil {
+		t.Fatal("expected conflict with an enabled proxy listener")
+	}
+	if !strings.Contains(err.Error(), "-health-addr") {
+		t.Fatalf("expected override context in error, got %v", err)
+	}
+}
+
+func TestApplyHealthAddressOverride_AllowsSharedObservability(t *testing.T) {
 	tests := []struct {
 		name   string
 		mutate func(*config.Config)
 	}{
-		{
-			name: "enabled listener",
-			mutate: func(cfg *config.Config) {
-				cfg.Listeners = append(cfg.Listeners, config.ListenerConfig{
-					Name: "edge-extra", Type: "http", Address: "127.0.0.1:9393", AuthType: "none", Enabled: true,
-				})
-			},
-		},
 		{
 			name: "other health endpoint",
 			mutate: func(cfg *config.Config) {
@@ -94,18 +101,25 @@ func TestApplyHealthAddressOverride_RejectsConflicts(t *testing.T) {
 				cfg.Observability.Metrics.Address = "127.0.0.1:9393"
 			},
 		},
+		{
+			name: "all observability endpoints",
+			mutate: func(cfg *config.Config) {
+				cfg.Observability.Metrics.Enabled = true
+				cfg.Observability.Metrics.Address = "127.0.0.1:9393"
+				cfg.Observability.HealthEndpoints.ReadinessAddress = "127.0.0.1:9393"
+				cfg.Observability.HealthEndpoints.StartupAddress = "127.0.0.1:9393"
+			},
+		},
 	}
 	for _, tc := range tests {
-		tc := tc
 		t.Run(tc.name, func(t *testing.T) {
 			cfg := healthTestConfig()
 			tc.mutate(cfg)
-			err := applyHealthAddressOverride(cfg, "127.0.0.1:9393")
-			if err == nil {
-				t.Fatalf("expected conflict error for %s", tc.name)
+			if err := applyHealthAddressOverride(cfg, "127.0.0.1:9393"); err != nil {
+				t.Fatalf("observability handlers should share one HTTP listener: %v", err)
 			}
-			if !strings.Contains(err.Error(), "-health-addr") {
-				t.Fatalf("expected override context in error, got %v", err)
+			if got := cfg.Observability.HealthEndpoints.LivenessAddress; got != "127.0.0.1:9393" {
+				t.Fatalf("expected CLI liveness override, got %q", got)
 			}
 		})
 	}

@@ -301,8 +301,8 @@ func TestBindConflictValidation(t *testing.T) {
 	cfg.Observability.Metrics.Enabled = true
 	cfg.Observability.Metrics.Address = "0.0.0.0:9090"
 	cfg.Observability.HealthEndpoints.LivenessAddress = "0.0.0.0:9090"
-	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "observability.health_endpoints.liveness_address") {
-		t.Fatalf("expected liveness/metrics conflict, got %v", err)
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("shared liveness/metrics listener must validate: %v", err)
 	}
 
 	cfg = baseConfig()
@@ -320,8 +320,8 @@ func TestBindConflictValidation(t *testing.T) {
 	cfg = baseConfig()
 	cfg.Observability.HealthEndpoints.StartupAddress = "127.0.0.1:9093"
 	cfg.Observability.HealthEndpoints.ReadinessAddress = "127.0.0.1:9093"
-	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "observability.health_endpoints.readiness_address") {
-		t.Fatalf("expected health endpoint conflict, got %v", err)
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("shared health listener must validate: %v", err)
 	}
 
 	// Service-name ports resolve to their numeric value so conflicts with the
