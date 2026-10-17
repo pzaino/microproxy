@@ -192,10 +192,18 @@ tenants:
 # (or private-network) binding. It rotates the SAME process that serves :8081.
 # microproxy-control provider rotation stubs are a separate contract and do not
 # mutate this runtime.
+# listener auth_type protects downstream proxy clients; session_control
+# auth_type protects this management API. They are independent.
+# auth_type: bearer (default when omitted) requires a non-empty bearer_token.
+# auth_type: none is loopback-only unless allow_unauthenticated_non_loopback is
+# explicitly set for a protected private network. An empty bearer_token never
+# implies none.
 session_control:
   enabled: true
   address: 127.0.0.1:8094
+  auth_type: bearer
   bearer_token: ${MICROPROXY_SESSION_API_KEY}
+  # allow_unauthenticated_non_loopback: false
   provider: corp-http-sticky
 
 observability:
@@ -210,6 +218,9 @@ observability:
     exporter: otlp
     endpoint: otel-collector.monitoring.svc.cluster.local:4317
   health_endpoints:
+    # -health-addr, when non-empty, overrides liveness_address and the effective
+    # configuration is revalidated before listeners start. Omit the flag to keep
+    # this YAML value.
     liveness_address: 0.0.0.0:9090
     readiness_address: 0.0.0.0:9092
     startup_address: 0.0.0.0:9093
@@ -233,5 +244,6 @@ observability:
 #              edge-http-sticky (:8081, provider proxyservice-residential-sticky, auth none)
 #   providers: proxyservice-residential (static basic) +
 #              proxyservice-residential-sticky (session mode username_template)
-#   session_control: 127.0.0.1:8094, bearer ${MICROPROXY_SESSION_API_KEY}
+#   session_control: 127.0.0.1:8094, auth_type bearer, bearer ${MICROPROXY_SESSION_API_KEY}
 #   CROWler: close browser -> POST rotate (Idempotency-Key) -> 200 -> start browser
+#   Latest-key replay: 200 + replayed=true; older key: 409 stale_idempotency_key

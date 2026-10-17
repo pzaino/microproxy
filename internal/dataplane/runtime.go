@@ -67,8 +67,14 @@ const (
 )
 
 func NewRequestRuntime(cfg *config.Config) listeners.RequestRuntime {
-	runtime, _ := NewRequestRuntimeE(cfg)
-	return runtime
+	manager, err := NewSessionManager(cfg)
+	if err != nil {
+		// The error-aware constructors surface this failure at startup.
+		// Without a live manager, session-enabled providers fail closed at
+		// request time instead of silently using the base username.
+		manager = nil
+	}
+	return NewRequestRuntimeWithSessionManager(cfg, manager)
 }
 
 // NewRequestRuntimeE builds the request runtime plus the shared session manager.

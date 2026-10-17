@@ -39,6 +39,18 @@ type idempotencyEntry struct {
 	createdAt  time.Time
 }
 
+// StaleIdempotencyKeyError reports a replay of a key that was already used for
+// an older rotation. The current identity is intentionally left untouched.
+type StaleIdempotencyKeyError struct {
+	Provider           string
+	OriginalGeneration uint64
+	CurrentGeneration  uint64
+}
+
+func (e *StaleIdempotencyKeyError) Error() string {
+	return fmt.Sprintf("idempotency key for provider %q was superseded: original generation %d, current generation %d", e.Provider, e.OriginalGeneration, e.CurrentGeneration)
+}
+
 type sessionProviderState struct {
 	provider   string
 	generation uint64
@@ -135,9 +147,10 @@ func (m *SessionManager) Snapshot(provider string) (listeners.SessionSnapshot, b
 	return listeners.SessionSnapshot{Provider: name, SessionID: state.sessionID, Generation: state.generation}, true
 }
 
-// Rotate atomically advances the sticky identity for provider. The same
-// idempotency key returns its prior generation without rotating again.
-// On RNG failure the previous state is preserved and an error returned.
+// Rotate atomically advances the sticky identity for provider. The most recent
+// idempotency key returns its prior generation without rotating again; a key
+// from an older generation returns *StaleIdempotencyKeyError. On RNG failure
+// the previous state is preserved and an error returned.
 func (m *SessionManager) Rotate(provider, idempotencyKey string) (listeners.SessionSnapshot, bool, error) {
 	name := strings.TrimSpace(provider)
 	if name == "" {
@@ -158,6 +171,13 @@ func (m *SessionManager) Rotate(provider, idempotencyKey string) (listeners.Sess
 	now := m.now().UTC()
 	m.evictExpiredLocked(state, now)
 	if entry, dup := state.keys[idempotencyKey]; dup {
+		if entry.generation < state.generation {
+			return listeners.SessionSnapshot{}, false, &StaleIdempotencyKeyError{
+				Provider:           name,
+				OriginalGeneration: entry.generation,
+				CurrentGeneration:  state.generation,
+			}
+		}
 		return listeners.SessionSnapshot{Provider: name, SessionID: entry.sessionID, Generation: entry.generation}, true, nil
 	}
 	sessionID, err := generateSessionID(m.randBytes)

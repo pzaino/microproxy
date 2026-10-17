@@ -259,6 +259,64 @@ func TestStickyIntegration_CONNECTUsernames(t *testing.T) {
 	}
 }
 
+func TestStickyIntegration_MissingSnapshotFailsClosedBeforeUpstream(t *testing.T) {
+	t.Parallel()
+	target := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, _ *http.Request) {
+		rw.WriteHeader(http.StatusOK)
+		_, _ = rw.Write([]byte("must-not-reach-target"))
+	}))
+	defer target.Close()
+	targetTCP := startPingPongTCPServer(t)
+	defer targetTCP.Close()
+
+	rotMock := newMockUpstream(t, "rot-user", "rot-pass")
+	stickyMock := newMockUpstream(t, "zone-user", "zone-pass")
+	cfg := stickyIntegrationConfig(rotMock.server.URL, stickyMock.server.URL)
+	// A manager without provider state cannot pin a sticky identity. The
+	// session-enabled adapter must fail closed rather than fall back to the
+	// base username or direct egress.
+	manager, err := NewSessionManager(&config.Config{SchemaVersion: "1"})
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	_, stickyProxyURL, _ := startStickyPair(t, cfg, manager)
+
+	resp, err := proxyClient(stickyProxyURL).Get(target.URL)
+	if err != nil {
+		t.Fatalf("sticky GET: %v", err)
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusBadGateway {
+		t.Fatalf("expected 502 fail-closed for missing snapshot, got %d: %s", resp.StatusCode, string(body))
+	}
+	if strings.Contains(string(body), "must-not-reach-target") {
+		t.Fatal("missing snapshot leaked a direct egress response")
+	}
+
+	proxyAddr := strings.TrimPrefix(stickyProxyURL, "http://")
+	conn, err := net.DialTimeout("tcp", proxyAddr, 2*time.Second)
+	if err != nil {
+		t.Fatalf("dial proxy: %v", err)
+	}
+	defer conn.Close()
+	targetAddr := targetTCP.Addr().String()
+	if _, err := fmt.Fprintf(conn, "CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n", targetAddr, targetAddr); err != nil {
+		t.Fatalf("connect write: %v", err)
+	}
+	reader := bufio.NewReader(conn)
+	statusLine, err := reader.ReadString('\n')
+	if err != nil {
+		t.Fatalf("connect status: %v", err)
+	}
+	if !strings.Contains(statusLine, "502") {
+		t.Fatalf("expected 502 fail-closed CONNECT, got %q", statusLine)
+	}
+	if usernames := stickyMock.allUsernames(); len(usernames) != 0 {
+		t.Fatalf("upstream must not be contacted without a snapshot, got %v", usernames)
+	}
+}
+
 func TestStickyIntegration_SpoofingBlocked(t *testing.T) {
 	t.Parallel()
 	target := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, _ *http.Request) {

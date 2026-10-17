@@ -7,9 +7,9 @@ import (
 
 func stickyProvider(name string) ProviderConfig {
 	return ProviderConfig{
-		Name: name,
-		Type: "http_proxy",
-		Auth: ProviderAuthConfig{Type: "basic", Username: "base-user", Password: "base-pass"},
+		Name:      name,
+		Type:      "http_proxy",
+		Auth:      ProviderAuthConfig{Type: "basic", Username: "base-user", Password: "base-pass"},
 		Endpoints: []ProviderEndpoint{{URL: "http://upstream.example:3128", Priority: 100}},
 		Session: ProviderSessionConfig{
 			Supported:        true,
@@ -160,6 +160,211 @@ func TestSessionControlValidation(t *testing.T) {
 	cfg.SessionControl = SessionControlConfig{Enabled: false}
 	if err := cfg.Validate(); err != nil {
 		t.Fatalf("expected disabled session_control to validate, got %v", err)
+	}
+}
+
+func TestSessionControlAuthTypeValidation(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name      string
+		mutate    func(*SessionControlConfig)
+		wantErr   string
+		wantValid bool
+	}{
+		{
+			name:    "omitted defaults to bearer and requires token",
+			mutate:  func(s *SessionControlConfig) { s.BearerToken = "" },
+			wantErr: "session_control.bearer_token",
+		},
+		{
+			name:      "omitted with token remains bearer",
+			mutate:    func(s *SessionControlConfig) {},
+			wantValid: true,
+		},
+		{
+			name:    "explicit bearer requires token",
+			mutate:  func(s *SessionControlConfig) { s.AuthType = SessionControlAuthBearer; s.BearerToken = "" },
+			wantErr: "session_control.bearer_token",
+		},
+		{
+			name: "none on loopback needs no token",
+			mutate: func(s *SessionControlConfig) {
+				s.AuthType = SessionControlAuthNone
+				s.BearerToken = ""
+			},
+			wantValid: true,
+		},
+		{
+			name: "none on localhost hostname",
+			mutate: func(s *SessionControlConfig) {
+				s.AuthType = SessionControlAuthNone
+				s.BearerToken = ""
+				s.Address = "localhost:8094"
+			},
+			wantValid: true,
+		},
+		{
+			name: "none on ipv6 loopback",
+			mutate: func(s *SessionControlConfig) {
+				s.AuthType = SessionControlAuthNone
+				s.BearerToken = ""
+				s.Address = "[::1]:8094"
+			},
+			wantValid: true,
+		},
+		{
+			name: "none on non-loopback rejected",
+			mutate: func(s *SessionControlConfig) {
+				s.AuthType = SessionControlAuthNone
+				s.BearerToken = ""
+				s.Address = "0.0.0.0:8094"
+			},
+			wantErr: "session_control.address",
+		},
+		{
+			name: "none on wildcard rejected",
+			mutate: func(s *SessionControlConfig) {
+				s.AuthType = SessionControlAuthNone
+				s.BearerToken = ""
+				s.Address = ":8094"
+			},
+			wantErr: "session_control.address",
+		},
+		{
+			name: "none with explicit unsafe opt-in",
+			mutate: func(s *SessionControlConfig) {
+				s.AuthType = SessionControlAuthNone
+				s.BearerToken = ""
+				s.Address = "0.0.0.0:8094"
+				s.AllowUnauthenticatedNonLoopback = true
+			},
+			wantValid: true,
+		},
+		{
+			name: "none ignores a residual bearer token",
+			mutate: func(s *SessionControlConfig) {
+				s.AuthType = SessionControlAuthNone
+			},
+			wantValid: true,
+		},
+		{
+			name: "unsafe opt-in with bearer rejected",
+			mutate: func(s *SessionControlConfig) {
+				s.AllowUnauthenticatedNonLoopback = true
+			},
+			wantErr: "session_control.allow_unauthenticated_non_loopback",
+		},
+		{
+			name: "unknown auth type rejected",
+			mutate: func(s *SessionControlConfig) {
+				s.AuthType = "basic"
+			},
+			wantErr: "session_control.auth_type",
+		},
+	}
+	for _, tc := range tests {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			cfg := baseConfig()
+			tc.mutate(&cfg.SessionControl)
+			err := cfg.Validate()
+			if tc.wantValid {
+				if err != nil {
+					t.Fatalf("expected valid config, got %v", err)
+				}
+				return
+			}
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+				t.Fatalf("expected error containing %q, got %v", tc.wantErr, err)
+			}
+		})
+	}
+}
+
+func TestSessionControlAuthTypeEffectiveDefault(t *testing.T) {
+	t.Parallel()
+	if got := (SessionControlConfig{}).EffectiveAuthType(); got != SessionControlAuthBearer {
+		t.Fatalf("omitted auth_type must default to bearer, got %q", got)
+	}
+	if got := (SessionControlConfig{BearerToken: ""}).EffectiveAuthType(); got != SessionControlAuthBearer {
+		t.Fatalf("empty token must not infer none, got %q", got)
+	}
+	if got := (SessionControlConfig{AuthType: " NONE "}).EffectiveAuthType(); got != SessionControlAuthNone {
+		t.Fatalf("expected normalized none, got %q", got)
+	}
+}
+
+func TestBindConflictValidation(t *testing.T) {
+	t.Parallel()
+	cfg := baseConfig()
+	cfg.Observability.Metrics.Enabled = true
+	cfg.Observability.Metrics.Address = "0.0.0.0:9090"
+	cfg.Observability.HealthEndpoints.LivenessAddress = "0.0.0.0:9090"
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "observability.health_endpoints.liveness_address") {
+		t.Fatalf("expected liveness/metrics conflict, got %v", err)
+	}
+
+	cfg = baseConfig()
+	cfg.Observability.HealthEndpoints.ReadinessAddress = "0.0.0.0:8081"
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "observability.health_endpoints.readiness_address") {
+		t.Fatalf("expected readiness/listener conflict, got %v", err)
+	}
+
+	cfg = baseConfig()
+	cfg.Observability.HealthEndpoints.LivenessAddress = "127.0.0.1:8094"
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "observability.health_endpoints.liveness_address") {
+		t.Fatalf("expected liveness/session-control conflict, got %v", err)
+	}
+
+	cfg = baseConfig()
+	cfg.Observability.HealthEndpoints.StartupAddress = "127.0.0.1:9093"
+	cfg.Observability.HealthEndpoints.ReadinessAddress = "127.0.0.1:9093"
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "observability.health_endpoints.readiness_address") {
+		t.Fatalf("expected health endpoint conflict, got %v", err)
+	}
+
+	// Service-name ports resolve to their numeric value so conflicts with the
+	// numeric form are still detected.
+	cfg = baseConfig()
+	cfg.Observability.HealthEndpoints.LivenessAddress = "127.0.0.1:http"
+	cfg.Observability.HealthEndpoints.ReadinessAddress = "127.0.0.1:80"
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "observability.health_endpoints.readiness_address") {
+		t.Fatalf("expected service-name port conflict, got %v", err)
+	}
+
+	// Ephemeral ports are assigned by the kernel and never conflict.
+	cfg = baseConfig()
+	cfg.Observability.Metrics.Enabled = true
+	cfg.Observability.Metrics.Address = "127.0.0.1:0"
+	cfg.Observability.HealthEndpoints.LivenessAddress = "127.0.0.1:0"
+	cfg.Observability.HealthEndpoints.ReadinessAddress = "127.0.0.1:0"
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("ephemeral endpoints must validate, got %v", err)
+	}
+}
+
+func TestObservabilityAddressValidation(t *testing.T) {
+	t.Parallel()
+	cfg := baseConfig()
+	cfg.Observability.Metrics.Enabled = true
+	cfg.Observability.Metrics.Address = "not-an-address"
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "observability.metrics.address") {
+		t.Fatalf("expected metrics address error, got %v", err)
+	}
+
+	// A disabled metrics endpoint is never bound, so its address is ignored.
+	cfg = baseConfig()
+	cfg.Observability.Metrics.Enabled = false
+	cfg.Observability.Metrics.Address = "not-an-address"
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("disabled metrics address must not fail validation, got %v", err)
+	}
+
+	cfg = baseConfig()
+	cfg.Observability.HealthEndpoints.LivenessAddress = "not-an-address"
+	if err := cfg.Validate(); err == nil || !strings.Contains(err.Error(), "observability.health_endpoints.liveness_address") {
+		t.Fatalf("expected liveness address error, got %v", err)
 	}
 }
 

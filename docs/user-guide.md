@@ -102,6 +102,7 @@ MicroProxy configuration is organized into the following top-level sections:
 - `policies`
 - `policy_engine`
 - `tenants`
+- `session_control`
 - `observability`
 
 ### 1) Listeners
@@ -155,6 +156,56 @@ Observability settings expose:
 - health endpoints for liveness/readiness/startup
 - optional tracing exporter configuration
 
+`-health-addr` is an optional CLI override for
+`observability.health_endpoints.liveness_address`. When the flag is omitted or
+blank, the YAML value is preserved. When it is non-empty, the override takes
+precedence and the effective configuration is validated again before any
+listener starts. A port collision with an enabled listener, `session_control`,
+metrics, or another health endpoint fails startup with a clear error. Each
+configured observability endpoint should use a distinct port; port `0` lets the
+kernel choose an ephemeral port.
+
+### 7) Session Control
+
+`session_control` enables the data-plane-local sticky-session management API
+(default `127.0.0.1:8094`) used to rotate the upstream identity of a
+session-enabled provider without restarting the process:
+
+```yaml
+session_control:
+  enabled: true
+  address: 127.0.0.1:8094
+  auth_type: bearer                    # bearer (default) or none
+  bearer_token: ${MICROPROXY_SESSION_API_KEY}
+  # allow_unauthenticated_non_loopback: false
+  provider: corp-http-sticky
+```
+
+- `listeners[].auth_type` authenticates downstream proxy clients. It is
+  independent from `session_control.auth_type`, which protects only the
+  management API. Control-plane `X-API-Key` credentials are not accepted by the
+  session API.
+- Omitted `session_control.auth_type` means `bearer`. Bearer mode requires a
+  non-empty token and rejects missing, invalid, or malformed `Authorization`
+  headers with 401. An empty `bearer_token` never implies `none`.
+- `auth_type: none` is intended for local VDI use and is valid only on loopback
+  (`127.0.0.1`, `[::1]`, `localhost`). Exposing it on a non-loopback address
+  requires the separate explicit `allow_unauthenticated_non_loopback: true`
+  opt-in and should be restricted to a protected private network.
+- `POST /api/v1/sessions/rotate` uses `Idempotency-Key`. A new key advances the
+  generation and returns `200 {"status":"rotated",...}`. Replaying the latest
+  key returns the original generation with `"replayed":true` and does not
+  rotate again or close connections. Reusing a retained older key returns
+  `409 stale_idempotency_key` with `original_generation` and
+  `current_generation`; identity is unchanged. Keys evicted beyond the bounded
+  retention window (512 entries, 24h) are treated as new rotations.
+- Rotate the session only after closing the old browser, and start the next
+  browser after the 200 acknowledgement. Established CONNECT tunnels survive
+  rotation; new requests use the new identity.
+
+See `docs/session-control.md` for the full CROWler contract and
+`api/session-control.openapi.yaml` for the API schema.
+
 ---
 
 ## Step-by-Step: Build and Run Locally
@@ -200,6 +251,11 @@ If no key is configured in development mode, a default dev key is used. Treat it
 ```bash
 ./bin/microproxy -config ./config.yaml -health-addr :9090
 ```
+
+The flag is optional. If omitted, the liveness address comes from
+`observability.health_endpoints.liveness_address` in YAML; a non-empty flag
+overrides it. The effective configuration is validated before listeners start,
+so conflicting ports fail fast with a clear startup error.
 
 ### Step 5: Start control plane
 

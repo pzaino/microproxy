@@ -63,8 +63,8 @@ type ListenerConfig struct {
 	// When set, it is a mandatory egress constraint: routing rules, client
 	// headers and policy route overrides cannot escape it. Empty preserves
 	// legacy routing behaviour.
-	Provider  string `json:"provider,omitempty" yaml:"provider,omitempty"`
-	Enabled   bool   `json:"enabled" yaml:"enabled"`
+	Provider string `json:"provider,omitempty" yaml:"provider,omitempty"`
+	Enabled  bool   `json:"enabled" yaml:"enabled"`
 }
 
 type TLSConfig struct {
@@ -109,8 +109,8 @@ type ProviderRotationConfig struct {
 }
 
 type ProviderSessionConfig struct {
-	Supported        bool   `json:"supported" yaml:"supported"`
-	RefreshSupported bool   `json:"refresh_supported" yaml:"refresh_supported"`
+	Supported        bool `json:"supported" yaml:"supported"`
+	RefreshSupported bool `json:"refresh_supported" yaml:"refresh_supported"`
 	// Mode enables runtime session identity. Empty disables runtime
 	// sessions (metadata only). "username_template" enables per-request
 	// username rendering from a pinned session snapshot.
@@ -120,11 +120,37 @@ type ProviderSessionConfig struct {
 	UsernameTemplate string `json:"username_template,omitempty" yaml:"username_template,omitempty"`
 }
 
+const (
+	// SessionControlAuthNone disables authentication on the session API. It is
+	// only allowed on loopback addresses unless explicitly opted out.
+	SessionControlAuthNone = "none"
+	// SessionControlAuthBearer requires a bearer token (default when omitted).
+	SessionControlAuthBearer = "bearer"
+)
+
 type SessionControlConfig struct {
-	Enabled     bool   `json:"enabled" yaml:"enabled"`
-	Address     string `json:"address,omitempty" yaml:"address,omitempty"`
+	Enabled bool   `json:"enabled" yaml:"enabled"`
+	Address string `json:"address,omitempty" yaml:"address,omitempty"`
+	// AuthType selects authentication for the management API: "bearer"
+	// (default when omitted) or "none". An empty value never infers "none";
+	// bearer_token must be non-empty in bearer mode.
+	AuthType    string `json:"auth_type,omitempty" yaml:"auth_type,omitempty"`
 	BearerToken string `json:"bearer_token,omitempty" yaml:"bearer_token,omitempty"`
-	Provider    string `json:"provider,omitempty" yaml:"provider,omitempty"`
+	// AllowUnauthenticatedNonLoopback explicitly permits auth_type "none" on
+	// a non-loopback bind. This is an unsafe exposure and must be set
+	// deliberately for a protected private network only.
+	AllowUnauthenticatedNonLoopback bool   `json:"allow_unauthenticated_non_loopback,omitempty" yaml:"allow_unauthenticated_non_loopback,omitempty"`
+	Provider                        string `json:"provider,omitempty" yaml:"provider,omitempty"`
+}
+
+// EffectiveAuthType normalizes the configured auth mode. Omitted auth_type
+// always means bearer; an empty token never downgrades to unauthenticated.
+func (s SessionControlConfig) EffectiveAuthType() string {
+	authType := strings.ToLower(strings.TrimSpace(s.AuthType))
+	if authType == "" {
+		return SessionControlAuthBearer
+	}
+	return authType
 }
 
 type ProviderGeoTargetingConfig struct {
@@ -544,7 +570,9 @@ func (c *Config) Validate() error {
 	errs.Merge(c.Routing.Validate("routing", providerNameSeen, policyNameSeen))
 	errs.Merge(c.PolicyEngine.Validate("policy_engine"))
 	errs.Merge(c.UpstreamProxy.Validate("upstream_proxy"))
+	errs.Merge(c.Observability.Validate("observability"))
 	errs.Merge(c.SessionControl.Validate("session_control", providerByName, c.Listeners, c.Observability))
+	errs.Merge(c.validateBindConflicts())
 
 	// Bound listeners must not reference a route/policy that escapes the binding.
 	// Enforcement happens at runtime; validation ensures referenced providers exist
@@ -1017,20 +1045,39 @@ func isHTTPSessionCapableProvider(provider ProviderConfig) bool {
 }
 
 // Validate enforces the data-plane-local session API contract.
-func (s SessionControlConfig) Validate(fieldPath string, providers map[string]ProviderConfig, listeners []ListenerConfig, obs ObservabilityConfig) *ValidationErrors {
+func (s SessionControlConfig) Validate(fieldPath string, providers map[string]ProviderConfig, _ []ListenerConfig, _ ObservabilityConfig) *ValidationErrors {
 	errs := &ValidationErrors{}
 	if !s.Enabled {
 		// Disabled API must not carry secrets or bindings.
 		return errs
 	}
+	addressValid := false
 	if strings.TrimSpace(s.Address) == "" {
 		errs.Add(fieldPath+".address", "is required when session_control is enabled")
 	} else if err := validateAddr(s.Address, fieldPath+".address"); err != nil {
 		errs.Add(fieldPath+".address", err.Error())
+	} else {
+		addressValid = true
 	}
-	if strings.TrimSpace(s.BearerToken) == "" {
-		errs.Add(fieldPath+".bearer_token", "is required when session_control is enabled")
+
+	switch authType := s.EffectiveAuthType(); authType {
+	case SessionControlAuthNone:
+		if !s.AllowUnauthenticatedNonLoopback {
+			if addressValid && !isLoopbackAddress(s.Address) {
+				errs.Add(fieldPath+".address", "must bind a loopback address when auth_type is none; set allow_unauthenticated_non_loopback: true only for an explicitly protected private network")
+			}
+		}
+	case SessionControlAuthBearer:
+		if strings.TrimSpace(s.BearerToken) == "" {
+			errs.Add(fieldPath+".bearer_token", "is required when session_control is enabled and auth_type is bearer")
+		}
+		if s.AllowUnauthenticatedNonLoopback {
+			errs.Add(fieldPath+".allow_unauthenticated_non_loopback", "is only valid when auth_type is none")
+		}
+	default:
+		errs.Add(fieldPath+".auth_type", "must be one of: none, bearer")
 	}
+
 	bound := strings.TrimSpace(s.Provider)
 	if bound == "" {
 		errs.Add(fieldPath+".provider", "is required when session_control is enabled")
@@ -1039,24 +1086,97 @@ func (s SessionControlConfig) Validate(fieldPath string, providers map[string]Pr
 	} else if !cfg.Session.SessionEnabled() {
 		errs.Add(fieldPath+".provider", "must reference a provider with session mode username_template enabled")
 	}
-	// Port collisions with listeners and observability endpoints fail validation.
-	if port := portFromAddr(s.Address); port != 0 {
-		for idx, l := range listeners {
-			if !l.Enabled {
-				continue
-			}
-			if portFromAddr(l.Address) == port {
-				errs.Add(fieldPath+".address", fmt.Sprintf("port collides with listeners[%d].address", idx))
-			}
+	return errs
+}
+
+// Validate checks observability listen addresses. A non-empty address must be
+// a valid listen address; empty disables that endpoint.
+func (o ObservabilityConfig) Validate(fieldPath string) *ValidationErrors {
+	errs := &ValidationErrors{}
+	type addressField struct {
+		field string
+		addr  string
+	}
+	addresses := []addressField{
+		{fieldPath + ".health_endpoints.liveness_address", o.HealthEndpoints.LivenessAddress},
+		{fieldPath + ".health_endpoints.readiness_address", o.HealthEndpoints.ReadinessAddress},
+		{fieldPath + ".health_endpoints.startup_address", o.HealthEndpoints.StartupAddress},
+	}
+	if o.Metrics.Enabled {
+		addresses = append(addresses, addressField{fieldPath + ".metrics.address", o.Metrics.Address})
+	}
+	for _, endpoint := range addresses {
+		if strings.TrimSpace(endpoint.addr) == "" {
+			continue
 		}
-		for _, addr := range []string{obs.Metrics.Address, obs.HealthEndpoints.LivenessAddress, obs.HealthEndpoints.ReadinessAddress, obs.HealthEndpoints.StartupAddress} {
-			if strings.TrimSpace(addr) != "" && portFromAddr(addr) == port {
-				errs.Add(fieldPath+".address", "port collides with an observability endpoint")
-				break
-			}
+		if err := validateAddr(endpoint.addr, endpoint.field); err != nil {
+			errs.Add(endpoint.field, err.Error())
 		}
 	}
 	return errs
+}
+
+// validateBindConflicts rejects two enabled endpoints that compete for the
+// same TCP port. Port 0 is intentionally ignored because the kernel assigns a
+// distinct ephemeral port to each listener.
+func (c *Config) validateBindConflicts() *ValidationErrors {
+	type bindEndpoint struct {
+		field   string
+		address string
+	}
+	errs := &ValidationErrors{}
+	endpoints := make([]bindEndpoint, 0, len(c.Listeners)+5)
+	for idx, listener := range c.Listeners {
+		if listener.Enabled {
+			endpoints = append(endpoints, bindEndpoint{field: fmt.Sprintf("listeners[%d].address", idx), address: listener.Address})
+		}
+	}
+	if c.SessionControl.Enabled {
+		endpoints = append(endpoints, bindEndpoint{field: "session_control.address", address: c.SessionControl.Address})
+	}
+	if c.Observability.Metrics.Enabled {
+		endpoints = append(endpoints, bindEndpoint{field: "observability.metrics.address", address: c.Observability.Metrics.Address})
+	}
+	endpoints = append(endpoints,
+		bindEndpoint{field: "observability.health_endpoints.liveness_address", address: c.Observability.HealthEndpoints.LivenessAddress},
+		bindEndpoint{field: "observability.health_endpoints.readiness_address", address: c.Observability.HealthEndpoints.ReadinessAddress},
+		bindEndpoint{field: "observability.health_endpoints.startup_address", address: c.Observability.HealthEndpoints.StartupAddress},
+	)
+	seen := map[int]bindEndpoint{}
+	for _, endpoint := range endpoints {
+		port := portFromAddr(endpoint.address)
+		if port == 0 {
+			continue
+		}
+		if previous, exists := seen[port]; exists {
+			errs.Add(endpoint.field, fmt.Sprintf("port %d conflicts with %s (%q)", port, previous.field, previous.address))
+			continue
+		}
+		seen[port] = endpoint
+	}
+	return errs
+}
+
+func isLoopbackAddress(addr string) bool {
+	addr = strings.TrimSpace(addr)
+	if addr == "" {
+		return false
+	}
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		host = addr
+	}
+	host = strings.Trim(strings.TrimSpace(strings.ToLower(host)), "[]")
+	if host == "" {
+		return false
+	}
+	if host == "localhost" {
+		return true
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		return ip.IsLoopback()
+	}
+	return false
 }
 
 func portFromAddr(addr string) int {
@@ -1064,17 +1184,19 @@ func portFromAddr(addr string) int {
 	if addr == "" {
 		return 0
 	}
-	if _, portStr, err := net.SplitHostPort(addr); err == nil {
-		if port, perr := strconv.Atoi(strings.TrimSpace(portStr)); perr == nil {
-			return port
+	_, portStr, err := net.SplitHostPort(addr)
+	if err != nil {
+		// Tolerate bare ":8094" style which SplitHostPort handles, and plain port.
+		if !strings.HasPrefix(addr, ":") {
+			return 0
 		}
+		portStr = strings.TrimPrefix(addr, ":")
+	}
+	// LookupPort accepts both numeric ports and service names (e.g. ":http")
+	// so conflicts are detected for addresses that validateAddr accepts.
+	port, err := net.LookupPort("tcp", strings.TrimSpace(portStr))
+	if err != nil {
 		return 0
 	}
-	// Tolerate bare ":8094" style which SplitHostPort handles, and plain port.
-	if strings.HasPrefix(addr, ":") {
-		if port, perr := strconv.Atoi(strings.TrimSpace(strings.TrimPrefix(addr, ":"))); perr == nil {
-			return port
-		}
-	}
-	return 0
+	return port
 }

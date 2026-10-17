@@ -44,8 +44,8 @@ Important fields to review in `config.yaml`:
 - `routing`: default provider and routing rules by tenant/host.
 - `policies`: allow/deny/header policies.
 - `tenants`: tenant-to-provider/policy binding.
-- `session_control`: VDI-local sticky rotation API (`127.0.0.1:8094`, bearer token, sticky provider).
-- `observability.health_endpoints`: liveness/readiness/startup ports.
+- `session_control`: VDI-local sticky rotation API (`127.0.0.1:8094`, `auth_type: bearer` by default, sticky provider). `auth_type: none` is loopback-only unless `allow_unauthenticated_non_loopback: true` is explicitly set. This protects the management API only; listener authentication protects downstream proxy clients.
+- `observability.health_endpoints`: liveness/readiness/startup ports. A non-empty `-health-addr` CLI flag overrides `liveness_address`; when omitted, the YAML value is used.
 
 > Tip: the example already includes single-provider, failover, and selenium-friendly scenarios as documented snippets, plus an active sticky VDI profile (`:8080`/`:8081`/`8094`).
 
@@ -81,6 +81,13 @@ Use two terminals.
 ```bash
 ./bin/microproxy -config ./config.yaml -health-addr :9090
 ```
+
+`-health-addr` is optional. When non-empty it overrides
+`observability.health_endpoints.liveness_address`; when omitted (or blank) the
+YAML value is preserved. An override is applied before listeners start and the
+effective configuration is validated again, so a collision with enabled
+listeners, session control, metrics, or another health endpoint fails startup
+with a clear error.
 
 ### Terminal B: control plane
 
@@ -240,6 +247,14 @@ curl -sS -X POST http://127.0.0.1:8094/api/v1/sessions/rotate \
   -H "Idempotency-Key: <unique-job-id>"
 # {"status":"rotated","provider":"corp-http-sticky","generation":2}
 ```
+
+Retrying the latest key returns the original generation with
+`"replayed": true` and does not rotate again. Reusing a retained older key
+after a newer rotation returns `409 stale_idempotency_key` with
+`original_generation`/`current_generation`; identity and connections are left
+untouched. Keys beyond the bounded retention window (512 entries, 24h) are
+treated as new rotations. With `session_control.auth_type: none`, omit the
+`Authorization` header (loopback binding only unless explicitly opted out).
 
 Persistent sessions can help maintain a consistent identity or connection state with the upstream proxy, which is useful for scenarios requiring session affinity or long-lived connections.
 

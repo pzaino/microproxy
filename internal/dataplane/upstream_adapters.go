@@ -81,17 +81,28 @@ type httpProxyAdapter struct {
 	sessionEnabled  bool
 }
 
-func (a httpProxyAdapter) effectiveCredentials(ctx context.Context, endpoint *url.URL) (string, string) {
+func (a httpProxyAdapter) effectiveCredentials(ctx context.Context, endpoint *url.URL) (string, string, error) {
 	username := a.auth.Username
 	password := a.auth.Password
 	if a.sessionEnabled {
-		if snapshot, ok := listeners.SessionSnapshotFromContext(ctx); ok {
-			if snapshot.Provider == a.providerName || a.providerName == "" {
-				if rendered, err := config.RenderUsername(a.sessionTemplate, a.auth.Username, snapshot.SessionID); err == nil {
-					username = rendered
-				}
-			}
+		// Session-enabled providers must never fall back to the base username:
+		// a missing/mismatched snapshot or a rendering failure would silently
+		// break stickiness and could leak non-sticky egress.
+		snapshot, ok := listeners.SessionSnapshotFromContext(ctx)
+		if !ok {
+			return "", "", fmt.Errorf("provider %q: sticky session snapshot is missing", a.providerName)
 		}
+		if strings.TrimSpace(snapshot.Provider) != strings.TrimSpace(a.providerName) {
+			return "", "", fmt.Errorf("provider %q: sticky session snapshot provider %q does not match", a.providerName, snapshot.Provider)
+		}
+		rendered, err := config.RenderUsername(a.sessionTemplate, a.auth.Username, snapshot.SessionID)
+		if err != nil {
+			return "", "", fmt.Errorf("provider %q: render sticky session username: %w", a.providerName, err)
+		}
+		if strings.TrimSpace(rendered) == "" {
+			return "", "", fmt.Errorf("provider %q: rendered sticky session username is empty", a.providerName)
+		}
+		username = rendered
 	}
 	// Preserve endpoint-userinfo fallback for non-session static auth.
 	if strings.TrimSpace(a.auth.Type) == "" || strings.EqualFold(strings.TrimSpace(a.auth.Type), "none") {
@@ -100,18 +111,21 @@ func (a httpProxyAdapter) effectiveCredentials(ctx context.Context, endpoint *ur
 			password, _ = endpoint.User.Password()
 		}
 	}
-	return username, password
+	return username, password, nil
 }
 
-func (a httpProxyAdapter) PrepareRequest(req *http.Request, endpoint *url.URL) (*http.Request, error) {
+func (a httpProxyAdapter) PrepareRequest(req *http.Request, _ *url.URL) (*http.Request, error) {
 	out := req.Clone(req.Context())
-	username, password := a.effectiveCredentials(req.Context(), endpoint)
+	username, password, err := a.effectiveCredentials(req.Context(), nil)
+	if err != nil {
+		return nil, err
+	}
 	effective := a.auth
 	effective.Username = username
 	effective.Password = password
-	// When session is enabled the rendered username must be used even if the
-	// base auth type was basic; force basic rendering path.
-	if a.sessionEnabled && strings.TrimSpace(username) != "" {
+	// Session mode requires basic upstream auth; the rendered username is
+	// guaranteed non-empty by effectiveCredentials.
+	if a.sessionEnabled {
 		effective.Type = "basic"
 	}
 	applyProxyAuth(out.Header, effective, nil)
@@ -121,6 +135,13 @@ func (a httpProxyAdapter) PrepareRequest(req *http.Request, endpoint *url.URL) (
 func (a httpProxyAdapter) DialConnect(ctx context.Context, targetAddr string, endpoint *url.URL, dialer *net.Dialer) (net.Conn, error) {
 	if endpoint == nil {
 		return nil, errors.New("missing upstream proxy endpoint")
+	}
+
+	// Resolve credentials before dialing so a session failure never contacts
+	// the upstream proxy.
+	username, password, err := a.effectiveCredentials(ctx, endpoint)
+	if err != nil {
+		return nil, err
 	}
 
 	address := endpoint.Host
@@ -140,11 +161,10 @@ func (a httpProxyAdapter) DialConnect(ctx context.Context, targetAddr string, en
 	}
 
 	connectHeaders := http.Header{}
-	username, password := a.effectiveCredentials(ctx, endpoint)
 	effective := a.auth
 	effective.Username = username
 	effective.Password = password
-	if a.sessionEnabled && strings.TrimSpace(username) != "" {
+	if a.sessionEnabled {
 		effective.Type = "basic"
 	}
 	applyProxyAuth(connectHeaders, effective, endpoint)
@@ -168,6 +188,13 @@ func (a httpProxyAdapter) RoundTrip(req *http.Request, endpoint *url.URL, transp
 	if endpoint == nil {
 		return nil, errors.New("missing upstream proxy endpoint")
 	}
+	return a.transportFor(endpoint, transport, responseHeaderTimeout).RoundTrip(req)
+}
+
+// transportFor clones the shared transport for one upstream endpoint. Session
+// mode disables keep-alives so a pooled connection authenticated with an old
+// identity can never be reused after rotation.
+func (a httpProxyAdapter) transportFor(endpoint *url.URL, transport *http.Transport, responseHeaderTimeout time.Duration) *http.Transport {
 	cloned := transport.Clone()
 	cloned.Proxy = http.ProxyURL(endpoint)
 	cloned.ResponseHeaderTimeout = responseHeaderTimeout
@@ -180,7 +207,7 @@ func (a httpProxyAdapter) RoundTrip(req *http.Request, endpoint *url.URL, transp
 		cloned.MaxIdleConnsPerHost = 0
 		cloned.IdleConnTimeout = 0
 	}
-	return cloned.RoundTrip(req)
+	return cloned
 }
 
 func (a httpProxyAdapter) RotateIdentity(context.Context) error {

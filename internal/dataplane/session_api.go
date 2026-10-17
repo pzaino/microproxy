@@ -2,6 +2,7 @@ package dataplane
 
 import (
 	"context"
+	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
@@ -18,10 +19,10 @@ import (
 )
 
 const (
-	sessionAPIMaxBodyBytes = 4 * 1024
+	sessionAPIMaxBodyBytes   = 4 * 1024
 	sessionAPIMaxHeaderBytes = 1 << 20
 	sessionReadHeaderTimeout = 5 * time.Second
-	sessionShutdownDrain = 10 * time.Second
+	sessionShutdownDrain     = 10 * time.Second
 )
 
 // SessionAPIServer is the data-plane-local authenticated management API.
@@ -29,12 +30,13 @@ const (
 // control-plane stub copy.
 type SessionAPIServer struct {
 	cfg      config.SessionControlConfig
+	authType string
 	manager  *SessionManager
 	onRotate func()
 
-	mu      sync.Mutex
-	started bool
-	server  *http.Server
+	mu       sync.Mutex
+	started  bool
+	server   *http.Server
 	listener net.Listener
 }
 
@@ -48,7 +50,12 @@ func NewSessionAPIServer(cfg *config.Config, manager *SessionManager, onRotate f
 		return nil
 	}
 	mux := http.NewServeMux()
-	s := &SessionAPIServer{cfg: control, manager: manager, onRotate: onRotate}
+	s := &SessionAPIServer{
+		cfg:      control,
+		authType: control.EffectiveAuthType(),
+		manager:  manager,
+		onRotate: onRotate,
+	}
 	mux.HandleFunc("/api/v1/sessions/rotate", s.handleRotate)
 	mux.HandleFunc("/api/v1/sessions/status", s.handleStatus)
 	s.server = &http.Server{
@@ -72,25 +79,42 @@ func (s *SessionAPIServer) Start(ctx context.Context) error {
 	s.started = true
 	s.mu.Unlock()
 
-	if strings.TrimSpace(s.cfg.Address) == "" {
-		return errors.New("session_control address is required")
-	}
-	if strings.TrimSpace(s.cfg.BearerToken) == "" {
-		return errors.New("session_control bearer token is required")
-	}
-	listener, err := net.Listen("tcp", s.server.Addr)
-	if err != nil {
+	failStart := func(err error) error {
 		s.mu.Lock()
 		s.started = false
 		s.mu.Unlock()
-		return fmt.Errorf("listen session api %s: %w", s.server.Addr, err)
+		return err
+	}
+
+	if strings.TrimSpace(s.cfg.Address) == "" {
+		return failStart(errors.New("session_control address is required"))
+	}
+	switch s.authType {
+	case config.SessionControlAuthNone:
+		if !isLoopbackHost(listenHost(s.server.Addr)) && !s.cfg.AllowUnauthenticatedNonLoopback {
+			return failStart(errors.New("session_control auth_type none requires a loopback address; set allow_unauthenticated_non_loopback to expose it on a protected private network"))
+		}
+	case config.SessionControlAuthBearer:
+		if strings.TrimSpace(s.cfg.BearerToken) == "" {
+			return failStart(errors.New("session_control bearer token is required when auth_type is bearer"))
+		}
+	default:
+		return failStart(fmt.Errorf("session_control auth_type %q is not supported", s.authType))
+	}
+	listener, err := net.Listen("tcp", s.server.Addr)
+	if err != nil {
+		return failStart(fmt.Errorf("listen session api %s: %w", s.server.Addr, err))
 	}
 	s.mu.Lock()
 	s.listener = listener
 	s.mu.Unlock()
 
 	if host := listenHost(s.server.Addr); !isLoopbackHost(host) {
-		slog.Warn("session management API bound to non-loopback address; restrict ingress to a private network", "address", s.server.Addr)
+		if s.authType == config.SessionControlAuthNone {
+			slog.Warn("session management API has authentication disabled and is bound to a non-loopback address", "address", s.server.Addr)
+		} else {
+			slog.Warn("session management API bound to non-loopback address; restrict ingress to a private network", "address", s.server.Addr)
+		}
 	}
 
 	go func() {
@@ -137,19 +161,36 @@ func (s *SessionAPIServer) Addr() string {
 }
 
 func (s *SessionAPIServer) checkAuth(r *http.Request) bool {
-	got := strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(r.Header.Get("Authorization")), "Bearer "))
-	if got == "" {
-		// Only Bearer is accepted; X-API-Key belongs to the control plane.
+	if s.authType == config.SessionControlAuthNone {
+		return true
+	}
+	values := r.Header.Values("Authorization")
+	if len(values) != 1 {
 		return false
 	}
-	want := s.cfg.BearerToken
-	if len(got) != len(want) {
-		// Constant-time compare requires equal length; use subtle on padded?
-		// Do a dummy compare to avoid early length oracle, then fail.
-		_ = subtle.ConstantTimeCompare([]byte(got), []byte(got))
+	got, ok := parseBearerCredential(values[0])
+	if !ok {
 		return false
 	}
-	return subtle.ConstantTimeCompare([]byte(got), []byte(want)) == 1
+	want := strings.TrimSpace(s.cfg.BearerToken)
+	// Hash both values so the comparison is constant-time regardless of the
+	// supplied token length, then compare the fixed-size digests.
+	gotDigest := sha256.Sum256([]byte(got))
+	wantDigest := sha256.Sum256([]byte(want))
+	return subtle.ConstantTimeCompare(gotDigest[:], wantDigest[:]) == 1
+}
+
+// parseBearerCredential accepts exactly one "Bearer <token>" credential.
+// Missing schemes, empty tokens and extra fields are malformed.
+func parseBearerCredential(header string) (string, bool) {
+	fields := strings.Fields(header)
+	if len(fields) != 2 || !strings.EqualFold(fields[0], "Bearer") {
+		return "", false
+	}
+	if fields[1] == "" {
+		return "", false
+	}
+	return fields[1], true
 }
 
 func (s *SessionAPIServer) handleRotate(rw http.ResponseWriter, req *http.Request) {
@@ -174,8 +215,30 @@ func (s *SessionAPIServer) handleRotate(rw http.ResponseWriter, req *http.Reques
 		return
 	}
 	provider := strings.TrimSpace(s.cfg.Provider)
-	snapshot, _, err := s.manager.Rotate(provider, key)
+	snapshot, replayed, err := s.manager.Rotate(provider, key)
 	if err != nil {
+		var stale *StaleIdempotencyKeyError
+		if errors.As(err, &stale) {
+			// The key was committed by an older rotation. Never mutate identity
+			// or close upstream connections for a superseded request.
+			slog.Info("session rotation rejected as stale idempotency key",
+				"provider", provider,
+				"original_generation", stale.OriginalGeneration,
+				"current_generation", stale.CurrentGeneration,
+			)
+			rw.Header().Set("Content-Type", "application/json")
+			rw.WriteHeader(http.StatusConflict)
+			_ = json.NewEncoder(rw).Encode(map[string]any{
+				"error": map[string]string{
+					"code":    "stale_idempotency_key",
+					"message": "idempotency key was superseded by a newer rotation",
+				},
+				"provider":            provider,
+				"original_generation": stale.OriginalGeneration,
+				"current_generation":  stale.CurrentGeneration,
+			})
+			return
+		}
 		if strings.Contains(strings.ToLower(err.Error()), "idempotency") || strings.Contains(strings.ToLower(err.Error()), "cannot be empty") || strings.Contains(strings.ToLower(err.Error()), "too long") || strings.Contains(strings.ToLower(err.Error()), "unsupported character") || strings.Contains(strings.ToLower(err.Error()), "printable") {
 			writeSessionError(rw, http.StatusBadRequest, "invalid_request", err.Error())
 			return
@@ -189,18 +252,28 @@ func (s *SessionAPIServer) handleRotate(rw http.ResponseWriter, req *http.Reques
 		writeSessionError(rw, http.StatusServiceUnavailable, "rotation_failed", "failed to generate a new session identity")
 		return
 	}
-	if s.onRotate != nil {
-		s.onRotate()
+	if replayed {
+		// Idempotent replay: the identity and generation are unchanged, so the
+		// rotation callback (connection cleanup) must not run again.
+		slog.Info("session rotation replayed", "provider", provider, "generation", snapshot.Generation)
+	} else {
+		if s.onRotate != nil {
+			s.onRotate()
+		}
+		// Safe audit log: provider + generation only, never identity/username.
+		slog.Info("session rotated", "provider", provider, "generation", snapshot.Generation)
 	}
-	// Safe audit log: provider + generation only, never identity/username.
-	slog.Info("session rotated", "provider", provider, "generation", snapshot.Generation)
 	rw.Header().Set("Content-Type", "application/json")
 	rw.WriteHeader(http.StatusOK)
-	_ = json.NewEncoder(rw).Encode(map[string]any{
+	payload := map[string]any{
 		"status":     "rotated",
 		"provider":   provider,
 		"generation": snapshot.Generation,
-	})
+	}
+	if replayed {
+		payload["replayed"] = true
+	}
+	_ = json.NewEncoder(rw).Encode(payload)
 }
 
 func (s *SessionAPIServer) handleStatus(rw http.ResponseWriter, req *http.Request) {
@@ -244,7 +317,10 @@ func listenHost(addr string) string {
 
 func isLoopbackHost(host string) bool {
 	host = strings.TrimSpace(strings.ToLower(host))
-	if host == "" || host == "localhost" || host == "127.0.0.1" || host == "::1" {
+	if host == "" {
+		return false
+	}
+	if host == "localhost" {
 		return true
 	}
 	if ip := net.ParseIP(host); ip != nil {

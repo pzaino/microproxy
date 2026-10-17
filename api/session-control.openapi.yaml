@@ -8,6 +8,12 @@ info:
     control-plane contract in api/controlplane.openapi.yaml, whose provider
     rotate/refresh routes are async stubs and do not mutate data-plane sticky
     identity.
+
+    Authentication is configured with `session_control.auth_type`: `bearer`
+    (the default when omitted) requires `Authorization: Bearer <token>` with a
+    non-empty `bearer_token`; `none` permits unauthenticated loopback access
+    only unless `allow_unauthenticated_non_loopback: true` is explicitly set.
+    Listener `auth_type` protects downstream proxy clients and is unrelated.
 servers:
   - url: http://127.0.0.1:8094
 paths:
@@ -21,13 +27,23 @@ paths:
         after the commit use the new credentials; established tunnels are
         preserved. Caller must close the old browser before calling and start
         the next browser only after 200.
+
+        Replaying the latest accepted Idempotency-Key while it is still
+        retained returns 200 with the original generation and `replayed: true`,
+        without a new identity or connection cleanup. Reusing a retained older
+        key returns 409 `stale_idempotency_key` with the original and current
+        generations. Keys evicted beyond the bounded retention window
+        (512 entries, 24h) are treated as new rotations.
       parameters:
         - name: Authorization
           in: header
-          required: true
+          required: false
           schema:
             type: string
-          description: Bearer <MICROPROXY_SESSION_API_KEY>
+          description: |
+            `Bearer <MICROPROXY_SESSION_API_KEY>`. Required when
+            `session_control.auth_type` is `bearer` (the default); ignored when
+            it is `none`.
         - name: Idempotency-Key
           in: header
           required: true
@@ -35,10 +51,13 @@ paths:
             type: string
             minLength: 1
             maxLength: 256
-          description: Unique caller job-boundary id. Replay returns prior generation.
+          description: |
+            Unique caller job-boundary id. Latest-key replay returns the prior
+            generation; a retained older key returns 409. Evicted keys start a
+            new rotation.
       responses:
         '200':
-          description: Rotated (or replayed) identity committed.
+          description: New rotation, or latest-key replay with replayed=true.
           content:
             application/json:
               schema:
@@ -50,7 +69,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorEnvelope'
         '401':
-          description: Missing or invalid bearer credentials.
+          description: Missing, invalid or malformed bearer credentials.
           content:
             application/json:
               schema:
@@ -61,6 +80,12 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorEnvelope'
+        '409':
+          description: Retained idempotency key was superseded by a newer rotation.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StaleIdempotencyKeyResponse'
         '503':
           description: Identity generation failed; previous state preserved.
           content:
@@ -71,13 +96,16 @@ paths:
     get:
       summary: Sticky/persistent session status
       operationId: getStickySessionStatus
-      description: Authenticated provider/generation only; never exposes identity.
+      description: |
+        Authenticated in bearer mode. Returns provider/generation only and never
+        exposes the session identity.
       parameters:
         - name: Authorization
           in: header
-          required: true
+          required: false
           schema:
             type: string
+          description: Required in bearer mode; ignored when auth_type is none.
       responses:
         '200':
           description: Current generation.
@@ -86,7 +114,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/StatusResponse'
         '401':
-          description: Missing or invalid bearer credentials.
+          description: Missing, invalid or malformed bearer credentials.
           content:
             application/json:
               schema:
@@ -113,6 +141,36 @@ components:
           type: integer
           format: int64
           example: 2
+        replayed:
+          type: boolean
+          description: |
+            Present as true only when the latest Idempotency-Key is replayed.
+            The generation is the original generation and no new identity is
+            created.
+          example: true
+    StaleIdempotencyKeyResponse:
+      type: object
+      required: [error, provider, original_generation, current_generation]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code:
+              type: string
+              const: stale_idempotency_key
+            message:
+              type: string
+        provider:
+          type: string
+        original_generation:
+          type: integer
+          format: int64
+          description: Generation committed by the stale key.
+        current_generation:
+          type: integer
+          format: int64
+          description: Current provider generation; identity is unchanged.
     StatusResponse:
       type: object
       required: [provider, generation]

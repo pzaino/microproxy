@@ -29,6 +29,11 @@ If you run multiple `microproxy` instances, you currently need external orchestr
 
 All `/api/v1/*` endpoints except `GET /api/v1/health` require auth.
 
+These credentials authenticate the **control plane only**. They do not
+authenticate the data-plane-local session management API on `127.0.0.1:8094`
+(see `docs/session-control.md`), which has its own `session_control.auth_type`
+and bearer token.
+
 Supported credentials:
 
 - `X-API-Key: <key>`
