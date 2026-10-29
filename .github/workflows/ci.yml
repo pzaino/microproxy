@@ -5,10 +5,12 @@ on:
     branches:
       - main
       - master
+      - develop
   push:
     branches:
       - main
       - master
+      - develop
   workflow_dispatch:
 
 permissions:

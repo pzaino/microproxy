@@ -112,7 +112,9 @@ A listener defines where and how downstream clients connect. Typical fields incl
 - `type` (for example HTTP)
 - `address` (bind host/port)
 - optional auth settings (`auth_type`, `username`, `password`)
-- `rate_limit`
+- `rate_limit` (requests/second; per-listener token bucket, burst equal to the
+  rate. Excess requests receive `429 Too Many Requests` with a `Retry-After`
+  header. A value of `0`/omitted disables limiting.)
 - `enabled`
 
 ### 2) Providers
@@ -122,7 +124,9 @@ A provider describes an upstream proxy service and can include:
 - provider identity and type
 - credentials for upstream auth
 - one or more endpoints
-- endpoint priority/weight for failover or weighted usage
+- endpoint priority/weight for failover ordering (primary: priority ascending;
+  within a priority, weight descending as a deterministic tie-breaker so a high-
+  weight endpoint is tried before a low-weight one)
 - active health-check settings
 
 ### 3) Routing
@@ -133,6 +137,11 @@ Typical strategy:
 
 - Set `default_provider` for unmatched traffic.
 - Add explicit rules for critical tenants or hostname suffixes.
+
+Rules are evaluated in order and first-match-wins. Each rule's `match` map may
+use any of: `tenant`/`tenant_id`, `provider`/`provider_id`, `host` (exact),
+`host_prefix` or `host_suffix` (matched case-insensitively against the proxy
+target host, port stripped).
 
 ### 4) Policies
 

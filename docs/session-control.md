@@ -136,6 +136,58 @@ session_control:
   unsafe unauthenticated non-loopback binding without opt-in, or a session API
   port colliding with enabled listeners, metrics, or another health endpoint.
 
+## Generic credential templating (`mode: credential_template`)
+
+In addition to the legacy `username_template` mode, a provider may render both
+the username and the password from base credentials, static parameters and a
+pinned session id using a small, provider-independent `{{token}}` template
+language. See `docs/generic-credential-templates.md` for the full contract,
+security model and examples (Evomi-style password-only, Bright Data-style
+username-only, and fully-templated credentials).
+
+Key points:
+
+- `session.mode: credential_template` enables per-request rendering of
+  `auth.templates.username` and/or `auth.templates.password`. A blank field means
+  "use the base credential unmodified," so a provider can encode only the
+  password (Evomi) or only the username (Bright Data) purely in configuration.
+- Tokens are substituted, never evaluated: the template is a fixed, validated
+  token/literal grammar with **no** script, shell or expression syntax.
+- Available built-in tokens are `{{username}}`, `{{password}}`,
+  `{{session_id}}`. Additional parameters are declared under
+  `auth.parameters`, each with exactly one of a static `value` or a fixed
+  endpoint-metadata `source` (`endpoint.country` / `endpoint.region`). Downstream
+  client headers can **never** name a parameter.
+- `credential_template` mode requires basic upstream auth with non-empty base
+  credentials and a template that references `{{session_id}}` (so rotation can
+  change the credential). Legacy `username_template` and generic templating are
+  mutually exclusive: a provider cannot combine `session.username_template` with
+  `auth.templates`.
+- Templating is allowed only for http-proxy-compatible providers; `direct` and
+  `socks5_proxy` reject it.
+
+### Configurable sticky-session identifier
+
+`session.id` configures the per-provider sticky identity generator:
+
+```yaml
+session:
+  supported: true
+  mode: credential_template
+  id:
+    length: 6      # 1..128
+    charset: alpha # hex (default), hex_upper, numeric, alpha, alpha_mixed,
+                   # alphanumeric, alphanumeric_low, urlsafe
+```
+
+- A zero/empty `id` selects the legacy default: a 32-character lowercase
+  hexadecimal identifier (128 bits of entropy).
+- The identifier is generated from `crypto/rand` with no modulo
+  bias (per-character rejection sampling) and fails closed on RNG failure.
+- Short identifiers (for example a 6-character id, ~29 bits) collide with
+  non-negligible probability after roughly 2^15 draws; prefer longer
+  identifiers for strong stickiness.
+
 ## HTTP contract
 
 `POST /api/v1/sessions/rotate` (data plane, not control plane):

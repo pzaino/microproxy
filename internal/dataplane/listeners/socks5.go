@@ -20,13 +20,6 @@ const (
 	socks5AtypIPv4   = 0x01
 	socks5AtypDomain = 0x03
 	socks5AtypIPv6   = 0x04
-
-	socks5ReplySucceeded          = 0x00
-	socks5ReplyGeneralFailure     = 0x01
-	socks5ReplyConnectionNotAllow = 0x02
-	socks5ReplyHostUnreachable    = 0x04
-	socks5ReplyCommandNotSupport  = 0x07
-	socks5ReplyAddressNotSupport  = 0x08
 )
 
 // SOCKS5AuthConfig controls handshake authentication behavior.

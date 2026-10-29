@@ -38,6 +38,7 @@ type RouteDecision struct {
 type RuntimeEndpoint struct {
 	URL      *url.URL
 	Priority int
+	Weight   int
 	Adapter  UpstreamAdapter
 	Health   EndpointHealthSnapshot
 }
@@ -275,12 +276,13 @@ func (h *ForwardProxyHandler) roundTripWithFallback(req *http.Request, endpoints
 		}
 		class := h.classifyTimeout(err)
 		h.observeEndpointOutcome(req.Context(), endpoint.URL, err, class)
-		errs = append(errs, wrapEndpointError(endpoint.URL, err, class))
+		wrappedErr := wrapEndpointError(endpoint.URL, err, class)
+		errs = append(errs, wrappedErr)
 		endpointLabel := "<direct>"
 		if endpoint.URL != nil {
-			endpointLabel = endpoint.URL.String()
+			endpointLabel = redactEndpointUserinfo(endpoint.URL.String(), endpoint.URL)
 		}
-		slog.Warn("forward upstream endpoint failed", "provider", providerFromContext(req.Context()), "endpoint", endpointLabel, "classification", class, "error", err)
+		slog.Warn("forward upstream endpoint failed", "provider", providerFromContext(req.Context()), "endpoint", endpointLabel, "classification", class, "error", wrappedErr)
 	}
 	return nil, errors.Join(errs...)
 }
@@ -674,10 +676,68 @@ func (h *ForwardProxyHandler) Shutdown(_ context.Context) error {
 }
 
 func wrapEndpointError(endpoint *url.URL, err error, class TimeoutClassification) error {
+	// Redact any basic-auth userinfo the underlying transport/TLS error may
+	// carry so a wrapped error logged or surfaced to callers never reveals the
+	// upstream credential. The redacted text is frozen in redactedError.Error so
+	// it cannot re-leak when the error is formatted again, while Unwrap keeps
+	// the original error for errors.Is/errors.As classification.
+	inner := &redactedError{cause: redactEndpointUserinfo(errString(err), endpoint), inner: err}
 	if endpoint == nil {
-		return fmt.Errorf("endpoint <direct> failed (%s): %w", class, err)
+		return fmt.Errorf("endpoint <direct> failed (%s): %w", class, inner)
 	}
-	return fmt.Errorf("endpoint %s failed (%s): %w", endpoint, class, err)
+	redactedHost := redactEndpointUserinfo(endpoint.String(), endpoint)
+	return fmt.Errorf("endpoint %s failed (%s): %w", redactedHost, class, inner)
+}
+
+func errString(err error) string {
+	if err == nil {
+		return ""
+	}
+	return err.Error()
+}
+
+// redactedError wraps an error whose printed text may carry basic-auth
+// userinfo. Error() returns the pre-redacted representation so the secret is
+// never re-emitted when the wrapped error is formatted; Unwrap preserves the
+// original error for errors.Is/errors.As.
+type redactedError struct {
+	cause string
+	inner error
+}
+
+func (e *redactedError) Error() string {
+	if e.cause == "" {
+		return "redacted"
+	}
+	return e.cause
+}
+
+func (e *redactedError) Unwrap() error {
+	return e.inner
+}
+
+// redactEndpointUserinfo masks basic-auth userinfo ("user:pass@") that a dial or
+// TLS error string may carry for an upstream endpoint. Only the endpoint's base
+// credentials appear in such transport error text; session-rendered
+// credentials travel in the request body/headers and are not part of dial/TLS
+// error output, so base-userinfo redaction fully covers the exposed values.
+func redactEndpointUserinfo(raw string, endpoint *url.URL) string {
+	if raw == "" || endpoint == nil || endpoint.User == nil {
+		return raw
+	}
+	password, _ := endpoint.User.Password()
+	if password == "" {
+		return raw
+	}
+	token := endpoint.User.String()
+	if token == "" || token == ":" {
+		return raw
+	}
+	masked := strings.TrimSuffix(token, ":"+password) + ":****"
+	// Mask the canonical "user:pass@host" form first, then a bare token, so the
+	// secret never survives either with or without the closing "@".
+	raw = strings.ReplaceAll(raw, token+"@", masked+"@")
+	return strings.ReplaceAll(raw, token, masked)
 }
 
 func timeoutForAttempt(base time.Duration, attempt int) time.Duration {

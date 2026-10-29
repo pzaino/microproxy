@@ -20,20 +20,30 @@ import (
 
 type upstreamAdapterFactory struct{}
 
+// ForProvider builds an adapter for a provider with no per-endpoint metadata
+// (country/region are blank). It is retained for callers and tests that do not
+// have a specific endpoint.
 func (upstreamAdapterFactory) ForProvider(provider config.ProviderConfig) listeners.UpstreamAdapter {
-	sessionEnabled := provider.Session.SessionEnabled()
-	sessionTemplate := ""
-	if sessionEnabled {
-		sessionTemplate = provider.Session.UsernameTemplate
-	}
+	return upstreamAdapterFactory{}.ForProviderEndpoint(provider, config.ProviderEndpoint{})
+}
+
+// ForProviderEndpoint builds an adapter for a specific endpoint, closing over that
+// endpoint's static country/region metadata so credential templates that source
+// from endpoint.country / endpoint.region resolve correctly.
+func (upstreamAdapterFactory) ForProviderEndpoint(provider config.ProviderConfig, endpoint config.ProviderEndpoint) listeners.UpstreamAdapter {
 	t := strings.ToLower(strings.TrimSpace(provider.Type))
+	components := buildAuthComponents(provider)
+	endpointMeta := config.EndpointMetadata{
+		Country: strings.TrimSpace(endpoint.Country),
+		Region:  strings.TrimSpace(endpoint.Region),
+	}
 	switch t {
 	case "direct":
 		return directAdapter{auth: provider.Auth}
 	case "socks5_proxy":
 		return socks5ProxyAdapter{auth: provider.Auth}
 	case "http_proxy", "https_proxy", "legacy_upstream_proxy":
-		return httpProxyAdapter{providerName: strings.TrimSpace(provider.Name), auth: provider.Auth, sessionTemplate: sessionTemplate, sessionEnabled: sessionEnabled}
+		return components.toAdapter(strings.TrimSpace(provider.Name), endpointMeta)
 	default:
 		for _, capability := range provider.Capabilities {
 			switch strings.ToLower(strings.TrimSpace(capability)) {
@@ -42,10 +52,10 @@ func (upstreamAdapterFactory) ForProvider(provider config.ProviderConfig) listen
 			case "socks5_proxy":
 				return socks5ProxyAdapter{auth: provider.Auth}
 			case "forward_proxy":
-				return httpProxyAdapter{providerName: strings.TrimSpace(provider.Name), auth: provider.Auth, sessionTemplate: sessionTemplate, sessionEnabled: sessionEnabled}
+				return components.toAdapter(strings.TrimSpace(provider.Name), endpointMeta)
 			}
 		}
-		return httpProxyAdapter{providerName: strings.TrimSpace(provider.Name), auth: provider.Auth, sessionTemplate: sessionTemplate, sessionEnabled: sessionEnabled}
+		return components.toAdapter(strings.TrimSpace(provider.Name), endpointMeta)
 	}
 }
 
@@ -75,43 +85,169 @@ func (a directAdapter) RotateIdentity(context.Context) error {
 func (a directAdapter) Capabilities() []string { return []string{"forward", "connect"} }
 
 type httpProxyAdapter struct {
-	providerName    string
-	auth            config.ProviderAuthConfig
-	sessionTemplate string
-	sessionEnabled  bool
+	providerName   string
+	auth           config.ProviderAuthConfig
+	renderer       *config.CredentialRenderer
+	rendererErr    error  // non-nil when a configured template could not be built
+	legacyTemplate string // legacy username_template mode
+	sessionMode    string // "username_template" | "credential_template" | ""
+	sessionEnabled bool
+	endpoint       config.EndpointMetadata
 }
 
+// authComponents are the per-provider rendering decisions built once and shared
+// by every endpoint of the provider.
+type authComponents struct {
+	auth           config.ProviderAuthConfig
+	renderer       *config.CredentialRenderer
+	rendererErr    error
+	legacyTemplate string
+	sessionMode    string
+	sessionEnabled bool
+}
+
+func buildAuthComponents(provider config.ProviderConfig) authComponents {
+	comp := authComponents{
+		auth:           provider.Auth,
+		legacyTemplate: provider.Session.UsernameTemplate,
+		sessionEnabled: provider.Session.SessionEnabled(),
+		sessionMode:    strings.ToLower(strings.TrimSpace(provider.Session.Mode)),
+	}
+	// Build the generic renderer only when a username/password template is
+	// present. A build error is stored so effectiveCredentials fails closed.
+	if config.HasCredentialTemplates(provider.Auth) {
+		renderer, err := config.NewCredentialRenderer(provider.Auth.Templates, provider.Auth.Parameters)
+		comp.renderer = renderer
+		comp.rendererErr = err
+	}
+	return comp
+}
+
+func (c authComponents) toAdapter(providerName string, endpoint config.EndpointMetadata) httpProxyAdapter {
+	return httpProxyAdapter{
+		providerName:   providerName,
+		auth:           c.auth,
+		renderer:       c.renderer,
+		rendererErr:    c.rendererErr,
+		legacyTemplate: c.legacyTemplate,
+		sessionMode:    c.sessionMode,
+		sessionEnabled: c.sessionEnabled,
+		endpoint:       endpoint,
+	}
+}
+
+// pinnedSnapshot returns the pinned sticky-session snapshot for this provider,
+// failing closed when it is missing or belongs to another provider. A session
+// identity has no silent fallback: a missing or mismatched snapshot is a hard
+// error so stickiness is never broken and non-sticky egress is never leaked.
+func (a httpProxyAdapter) pinnedSnapshot(ctx context.Context) (listeners.SessionSnapshot, error) {
+	snapshot, ok := listeners.SessionSnapshotFromContext(ctx)
+	if !ok {
+		return listeners.SessionSnapshot{}, fmt.Errorf("provider %q: sticky session snapshot is missing", a.providerName)
+	}
+	if strings.TrimSpace(snapshot.Provider) != strings.TrimSpace(a.providerName) {
+		return listeners.SessionSnapshot{}, fmt.Errorf("provider %q: sticky session snapshot provider %q does not match", a.providerName, snapshot.Provider)
+	}
+	return snapshot, nil
+}
+
+// effectiveCredentials composes the final (username, password) sent to the
+// upstream. It supports, independently and additively:
+//   - legacy username_template sticky mode (unchanged): render the username from
+//     session.username_template with the pinned session id, keep the base password;
+//   - generic credential templating (auth.templates + auth.parameters): render
+//     username and/or password from base credentials, static/endpoint parameters
+//     and, for credential_template mode, the pinned session id;
+//   - the legacy endpoint-userinfo fallback for untyped, non-templated auth.
+//
+// Any required-but-unresolved input fails closed: the credential is never
+// silently downgraded to the base value or to direct egress.
 func (a httpProxyAdapter) effectiveCredentials(ctx context.Context, endpoint *url.URL) (string, string, error) {
+	// A configured but unbuildable template must fail closed before any dial.
+	if a.rendererErr != nil {
+		return "", "", fmt.Errorf("provider %q: invalid credential template: %w", a.providerName, a.rendererErr)
+	}
 	username := a.auth.Username
 	password := a.auth.Password
-	if a.sessionEnabled {
-		// Session-enabled providers must never fall back to the base username:
-		// a missing/mismatched snapshot or a rendering failure would silently
-		// break stickiness and could leak non-sticky egress.
-		snapshot, ok := listeners.SessionSnapshotFromContext(ctx)
-		if !ok {
-			return "", "", fmt.Errorf("provider %q: sticky session snapshot is missing", a.providerName)
-		}
-		if strings.TrimSpace(snapshot.Provider) != strings.TrimSpace(a.providerName) {
-			return "", "", fmt.Errorf("provider %q: sticky session snapshot provider %q does not match", a.providerName, snapshot.Provider)
-		}
-		rendered, err := config.RenderUsername(a.sessionTemplate, a.auth.Username, snapshot.SessionID)
+
+	// Legacy username_template sticky mode: unchanged behaviour.
+	if a.sessionMode == "username_template" {
+		snapshot, err := a.pinnedSnapshot(ctx)
 		if err != nil {
-			return "", "", fmt.Errorf("provider %q: render sticky session username: %w", a.providerName, err)
+			return "", "", err
 		}
-		if strings.TrimSpace(rendered) == "" {
-			return "", "", fmt.Errorf("provider %q: rendered sticky session username is empty", a.providerName)
+		rendered, err := a.renderStickyUsername(snapshot.SessionID)
+		if err != nil {
+			return "", "", err
 		}
 		username = rendered
 	}
-	// Preserve endpoint-userinfo fallback for non-session static auth.
-	if strings.TrimSpace(a.auth.Type) == "" || strings.EqualFold(strings.TrimSpace(a.auth.Type), "none") {
-		if strings.TrimSpace(username) == "" && endpoint != nil && endpoint.User != nil {
-			username = endpoint.User.Username()
-			password, _ = endpoint.User.Password()
+
+	// Generic credential rendering (credential_template mode and static
+	// templating share this path).
+	if a.renderer != nil {
+		sessionID := ""
+		if a.sessionMode == "credential_template" {
+			snapshot, err := a.pinnedSnapshot(ctx)
+			if err != nil {
+				return "", "", err
+			}
+			sessionID = snapshot.SessionID
+		}
+		renderedUser, renderedPass, err := a.renderer.Render(config.CredentialRenderContext{
+			Username:  a.auth.Username,
+			Password:  a.auth.Password,
+			SessionID: sessionID,
+			Endpoint:  a.endpoint,
+		})
+		if err != nil {
+			return "", "", fmt.Errorf("provider %q: render credential template: %w", a.providerName, err)
+		}
+		username = renderedUser
+		password = renderedPass
+	}
+
+	// Preserve endpoint-userinfo fallback for non-templated, untyped static auth.
+	if a.renderer == nil {
+		if strings.TrimSpace(a.auth.Type) == "" || strings.EqualFold(strings.TrimSpace(a.auth.Type), "none") {
+			if strings.TrimSpace(username) == "" && endpoint != nil && endpoint.User != nil {
+				username = endpoint.User.Username()
+				password, _ = endpoint.User.Password()
+			}
 		}
 	}
 	return username, password, nil
+}
+
+// renderStickyUsername renders a legacy username_template with the pinned
+// session id. A sticky template must be well-formed and must embed the session
+// id; a template that would not vary per session fails closed so stickiness is
+// never silently broken.
+func (a httpProxyAdapter) renderStickyUsername(sessionID string) (string, error) {
+	if err := config.ValidateUsernameTemplate(a.legacyTemplate); err != nil {
+		return "", fmt.Errorf("provider %q: render sticky session username: %w", a.providerName, err)
+	}
+	rendered, err := config.RenderUsername(a.legacyTemplate, a.auth.Username, sessionID)
+	if err != nil {
+		return "", fmt.Errorf("provider %q: render sticky session username: %w", a.providerName, err)
+	}
+	if strings.TrimSpace(rendered) == "" {
+		return "", fmt.Errorf("provider %q: rendered sticky session username is empty", a.providerName)
+	}
+	return rendered, nil
+}
+
+// applyRenderedAuth sets basic Proxy-Authorization on headers from the effective
+// credentials, overriding the base auth type when the adapter is session-enabled
+// so a rendered credential is always delivered as basic.
+func (a httpProxyAdapter) applyRenderedAuth(headers http.Header, username, password string, endpoint *url.URL) {
+	effective := a.auth
+	effective.Username = username
+	effective.Password = password
+	if a.sessionMode == "credential_template" || a.sessionMode == "username_template" {
+		effective.Type = "basic"
+	}
+	applyProxyAuth(headers, effective, endpoint)
 }
 
 func (a httpProxyAdapter) PrepareRequest(req *http.Request, _ *url.URL) (*http.Request, error) {
@@ -120,15 +256,9 @@ func (a httpProxyAdapter) PrepareRequest(req *http.Request, _ *url.URL) (*http.R
 	if err != nil {
 		return nil, err
 	}
-	effective := a.auth
-	effective.Username = username
-	effective.Password = password
-	// Session mode requires basic upstream auth; the rendered username is
-	// guaranteed non-empty by effectiveCredentials.
-	if a.sessionEnabled {
-		effective.Type = "basic"
-	}
-	applyProxyAuth(out.Header, effective, nil)
+	// Session mode and templated credentials are always delivered as basic
+	// Proxy-Authorization.
+	a.applyRenderedAuth(out.Header, username, password, nil)
 	return out, nil
 }
 
@@ -161,13 +291,7 @@ func (a httpProxyAdapter) DialConnect(ctx context.Context, targetAddr string, en
 	}
 
 	connectHeaders := http.Header{}
-	effective := a.auth
-	effective.Username = username
-	effective.Password = password
-	if a.sessionEnabled {
-		effective.Type = "basic"
-	}
-	applyProxyAuth(connectHeaders, effective, endpoint)
+	a.applyRenderedAuth(connectHeaders, username, password, endpoint)
 	if err := writeConnect(conn, targetAddr, connectHeaders); err != nil {
 		_ = conn.Close()
 		return nil, err

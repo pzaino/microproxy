@@ -168,11 +168,14 @@ func NewHTTPListenerManager(listenerConfigs []config.ListenerConfig, drainTimeou
 
 	states := make([]*serverState, 0, len(listenerConfigs))
 	for _, listenerCfg := range listenerConfigs {
-		// Per-listener chain: auth -> metadata -> trusted binding -> observability -> handler.
-		// Binding is injected from server config, never from client headers.
+		// Per-listener chain: auth -> metadata -> trusted binding -> observability
+		// -> rate limit -> handler. Binding is injected from server config, never
+		// from client headers. The rate limit is a per-listener aggregate shed so
+		// excess load never reaches the proxy handler; 429s are still observed.
 		bound := listenerCfg
 		inner := observability.HTTPMiddleware(proxyHandler, accessLogEnabled)
-		withBinding := listeners.ListenerBindingMiddleware(bound.Name, bound.Provider, inner)
+		rateLimited := listeners.NewRateLimitMiddleware(bound.RateLimit, inner)
+		withBinding := listeners.ListenerBindingMiddleware(bound.Name, bound.Provider, rateLimited)
 		baseChain := listeners.MetadataMiddleware(withBinding)
 		authChain := listeners.ListenerAuthMiddleware(listenerCfg.AuthType, listenerCfg.Username, listenerCfg.Password, baseChain)
 		server := &http.Server{

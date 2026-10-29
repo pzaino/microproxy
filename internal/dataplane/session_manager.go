@@ -2,7 +2,6 @@ package dataplane
 
 import (
 	"crypto/rand"
-	"encoding/hex"
 	"fmt"
 	"strings"
 	"sync"
@@ -13,8 +12,6 @@ import (
 )
 
 const (
-	// sessionIDBytes is 16 bytes = 128 bits of entropy per backlog.
-	sessionIDBytes = 16
 	// maxIdempotencyEntries bounds per-provider idempotency memory.
 	maxIdempotencyEntries = 512
 	// idempotencyTTL bounds entry lifetime; state is process-local anyway.
@@ -55,6 +52,7 @@ type sessionProviderState struct {
 	provider   string
 	generation uint64
 	sessionID  string
+	idCfg      config.SessionIDConfig
 	keys       map[string]idempotencyEntry
 	keyOrder   []string
 }
@@ -99,10 +97,14 @@ func NewSessionManagerWithRand(cfg *config.Config, randFn func(int) ([]byte, err
 		if !provider.Session.SessionEnabled() {
 			continue
 		}
-		if err := config.ValidateUsernameTemplate(provider.Session.UsernameTemplate); err != nil {
-			return nil, fmt.Errorf("provider %q session template: %w", name, err)
+		// Build the manager only from validated configs in production, but the
+		// manager can also be constructed from an unvalidated config (e.g.
+		// negative tests). Fail closed here so a malformed session template or
+		// id generator never starts a listener with an unusable identity.
+		if verr := provider.Session.Validate("providers.session", provider).OrNil(); verr != nil {
+			return nil, fmt.Errorf("provider %q session config: %w", name, verr)
 		}
-		sessionID, err := generateSessionID(randFn)
+		sessionID, err := generateSessionID(m.randBytes, provider.Session.ID)
 		if err != nil {
 			return nil, fmt.Errorf("provider %q initial session: %w", name, err)
 		}
@@ -110,22 +112,18 @@ func NewSessionManagerWithRand(cfg *config.Config, randFn func(int) ([]byte, err
 			provider:   name,
 			generation: 1,
 			sessionID:  sessionID,
+			idCfg:      provider.Session.ID,
 			keys:       map[string]idempotencyEntry{},
 		}
 	}
 	return m, nil
 }
 
-func generateSessionID(randFn func(int) ([]byte, error)) (string, error) {
-	b, err := randFn(sessionIDBytes)
-	if err != nil {
-		return "", err
-	}
-	if len(b) != sessionIDBytes {
-		return "", fmt.Errorf("short random read: got %d bytes, want %d", len(b), sessionIDBytes)
-	}
-	// Lowercase hex is URL- and username-safe.
-	return hex.EncodeToString(b), nil
+// generateSessionID produces a per-provider sticky-session identifier using the
+// provider's configured length/charset. An empty config selects the legacy
+// default: 32 lowercase-hex characters (16 bytes, 128 bits of entropy).
+func generateSessionID(randFn func(int) ([]byte, error), idCfg config.SessionIDConfig) (string, error) {
+	return config.GenerateSessionID(randFn, idCfg)
 }
 
 // Snapshot returns the current pinned identity for a session-enabled provider.
@@ -180,7 +178,7 @@ func (m *SessionManager) Rotate(provider, idempotencyKey string) (listeners.Sess
 		}
 		return listeners.SessionSnapshot{Provider: name, SessionID: entry.sessionID, Generation: entry.generation}, true, nil
 	}
-	sessionID, err := generateSessionID(m.randBytes)
+	sessionID, err := generateSessionID(m.randBytes, state.idCfg)
 	if err != nil {
 		return listeners.SessionSnapshot{}, false, fmt.Errorf("generate session identity: %w", err)
 	}

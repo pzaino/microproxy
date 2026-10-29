@@ -31,6 +31,9 @@ type socks5ServerState struct {
 	cfg      config.ListenerConfig
 	listener net.Listener
 
+	// gate enforces the per-listener accept rate limit. Nil means no limiting.
+	gate *listeners.PerConnGate
+
 	connMu sync.Mutex
 	conns  map[net.Conn]struct{}
 	wg     sync.WaitGroup
@@ -42,7 +45,11 @@ func NewSOCKS5ListenerManager(listenerConfigs []config.ListenerConfig, drainTime
 	}
 	states := make([]*socks5ServerState, 0, len(listenerConfigs))
 	for _, listenerCfg := range listenerConfigs {
-		states = append(states, &socks5ServerState{cfg: listenerCfg, conns: make(map[net.Conn]struct{})})
+		states = append(states, &socks5ServerState{
+			cfg:   listenerCfg,
+			gate:  listeners.NewPerConnGate(listenerCfg.RateLimit),
+			conns: make(map[net.Conn]struct{}),
+		})
 	}
 	return &SOCKS5ListenerManager{
 		drainTimeout: drainTimeout,
@@ -81,6 +88,12 @@ func (m *SOCKS5ListenerManager) serveListener(state *socks5ServerState) {
 			if errors.Is(err, net.ErrClosed) {
 				return
 			}
+			continue
+		}
+		if state.gate != nil && !state.gate.Allow() {
+			// Rate-limited accept: shed the load by closing the connection
+			// without a handshake reply.
+			_ = conn.Close()
 			continue
 		}
 		state.trackConn(conn)

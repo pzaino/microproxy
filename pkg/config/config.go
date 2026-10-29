@@ -93,6 +93,14 @@ type ProviderAuthConfig struct {
 	Password string            `json:"password,omitempty" yaml:"password,omitempty"`
 	Token    string            `json:"token,omitempty" yaml:"token,omitempty"`
 	Headers  map[string]string `json:"headers,omitempty" yaml:"headers,omitempty"`
+	// Templates optionally render the username and/or password from base
+	// credentials, static parameters and endpoint metadata using a small
+	// {{token}} syntax. A blank field means "use the base credential."
+	Templates CredentialTemplates `json:"templates,omitempty" yaml:"templates,omitempty"`
+	// Parameters declares named {{token}} values for Templates. A parameter sets
+	// exactly one of Value (a static literal) or Source (a fixed
+	// endpoint-metadata field such as endpoint.country).
+	Parameters map[string]CredentialParameter `json:"parameters,omitempty" yaml:"parameters,omitempty"`
 }
 
 type ProviderEndpoint struct {
@@ -111,13 +119,18 @@ type ProviderRotationConfig struct {
 type ProviderSessionConfig struct {
 	Supported        bool `json:"supported" yaml:"supported"`
 	RefreshSupported bool `json:"refresh_supported" yaml:"refresh_supported"`
-	// Mode enables runtime session identity. Empty disables runtime
-	// sessions (metadata only). "username_template" enables per-request
-	// username rendering from a pinned session snapshot.
+	// Mode enables runtime session identity. Empty disables runtime sessions
+	// (metadata only). "username_template" enables per-request username rendering
+	// via UsernameTemplate. "credential_template" enables per-request username and
+	// password rendering via Auth.Templates (the generic credential renderer).
 	Mode string `json:"mode,omitempty" yaml:"mode,omitempty"`
-	// UsernameTemplate uses distinct {{username}} / {{session_id}} tokens.
-	// ${...} is NOT supported here because config loading expands env vars.
+	// UsernameTemplate uses distinct {{username}} / {{session_id}} tokens. ${...}
+	// is NOT supported here because config loading expands env vars.
 	UsernameTemplate string `json:"username_template,omitempty" yaml:"username_template,omitempty"`
+	// ID configures the sticky-session identifier generator (length and
+	// charset). Zero/empty selects the legacy default (32-character lowercase
+	// hexadecimal, 128 bits of entropy).
+	ID SessionIDConfig `json:"id,omitempty" yaml:"id,omitempty"`
 }
 
 const (
@@ -664,6 +677,19 @@ func (p ProviderConfig) Validate(fieldPath string) *ValidationErrors {
 	errs.Merge(p.Auth.Validate(fieldPath + ".auth"))
 	errs.Merge(p.Health.Validate(fieldPath + ".health"))
 	errs.Merge(p.Session.Validate(fieldPath+".session", p))
+	// Generic credential templates are validated here so that static (non-session)
+	// providers are checked too. When the provider is session-enabled,
+	// Session.Validate also validates the template surface; the checks are
+	// additive and idempotent.
+	errs.Merge(validateCredentialTemplates(p.Auth, p.Session))
+
+	// Credential templates are only meaningful for http_proxy-compatible
+	// providers (where rendered credentials become Proxy-Authorization or a
+	// CONNECT credential). Reject templating on direct or socks5 upstreams
+	// rather than silently ignoring the templates.
+	if HasCredentialTemplates(p.Auth) && !isHTTPSessionCapableProvider(p) {
+		errs.Add(fieldPath+".auth.templates", fmt.Sprintf("is not supported for provider type %q; credential templates require an http_proxy compatible provider", p.Type))
+	}
 	return errs
 }
 
@@ -903,20 +929,32 @@ func validateAddr(addr, field string) error {
 }
 
 // SessionEnabled reports whether a provider is explicitly configured for
-// runtime sticky-session identity (opt-in username templating).
+// runtime sticky-session identity (opt-in credential templating). Both the
+// legacy "username_template" mode and the new "credential_template" mode enable
+// runtime identity.
 func (s ProviderSessionConfig) SessionEnabled() bool {
 	if !s.Supported {
 		return false
 	}
-	return strings.EqualFold(strings.TrimSpace(s.Mode), "username_template")
+	switch strings.ToLower(strings.TrimSpace(s.Mode)) {
+	case "username_template", "credential_template":
+		return true
+	default:
+		return false
+	}
 }
 
-// Validate checks the opt-in session template contract. Provider type is
-// checked so unsupported upstreams reject session configuration explicitly.
+// Validate checks the opt-in runtime-session contract for a provider. It
+// supports the legacy "username_template" mode (unchanged) and the new
+// "credential_template" mode (generic username/password rendering). Provider
+// type and auth type are checked so unsupported upstreams reject session
+// configuration explicitly and fail closed.
 func (s ProviderSessionConfig) Validate(fieldPath string, provider ProviderConfig) *ValidationErrors {
 	errs := &ValidationErrors{}
-	mode := strings.TrimSpace(s.Mode)
+	mode := strings.ToLower(strings.TrimSpace(s.Mode))
 	template := s.UsernameTemplate
+
+	// Metadata-only configuration: no runtime identity.
 	if mode == "" {
 		if strings.TrimSpace(template) != "" {
 			errs.Add(fieldPath+".username_template", "must be empty unless session mode is set")
@@ -926,40 +964,82 @@ func (s ProviderSessionConfig) Validate(fieldPath string, provider ProviderConfi
 		}
 		return errs
 	}
-	if !strings.EqualFold(mode, "username_template") {
-		errs.Add(fieldPath+".mode", "must be one of: username_template")
+
+	switch mode {
+	case "username_template", "credential_template":
+		// acceptable modes
+	default:
+		errs.Add(fieldPath+".mode", "must be one of: username_template, credential_template")
 		return errs
 	}
+
 	if !s.Supported {
 		errs.Add(fieldPath+".supported", "must be true when session mode is enabled")
 	}
-	if strings.TrimSpace(template) == "" {
-		errs.Add(fieldPath+".username_template", "is required when session mode is enabled")
+	if !isHTTPSessionCapableProvider(provider) {
+		errs.Add(fieldPath+".mode", "runtime session mode requires an http_proxy compatible provider type")
+	}
+
+	// Per-provider session identifier generator.
+	errs.Merge(s.ID.validate(fieldPath + ".id"))
+
+	switch mode {
+	case "username_template":
+		// Legacy mode: unchanged behaviour. The legacy username template must be
+		// present, valid, and compatible with basic auth so the rendered username
+		// has a stable password to pair with.
+		if strings.TrimSpace(template) == "" {
+			errs.Add(fieldPath+".username_template", "is required when session mode is username_template")
+		} else if err := ValidateUsernameTemplate(template); err != nil {
+			errs.Add(fieldPath+".username_template", err.Error())
+		}
+		// username_template mode cannot coexist with generic credential templates.
+		if hasAuthTemplates(provider.Auth) {
+			errs.Add("auth.templates", "cannot combine auth templates with username_template session mode; use credential_template mode")
+		}
+		errs.Merge(baseCredentialChecks(fieldPath+".mode", provider.Auth))
+	case "credential_template":
+		// Generic renderer mode: auth.templates render username/password with the
+		// pinned session_id. Conflicting legacy template fields are rejected.
+		if strings.TrimSpace(template) != "" {
+			errs.Add(fieldPath+".username_template", "cannot combine username_template with credential_template mode; use auth.templates instead")
+		}
+		errs.Merge(validateCredentialTemplates(provider.Auth, s))
+	}
+
+	return errs
+}
+
+func hasAuthTemplates(auth ProviderAuthConfig) bool {
+	return HasCredentialTemplates(auth)
+}
+
+// HasCredentialTemplates reports whether a provider declares any credential
+// templates or parameters that engage the generic credential renderer.
+func HasCredentialTemplates(auth ProviderAuthConfig) bool {
+	return strings.TrimSpace(auth.Templates.Username) != "" || strings.TrimSpace(auth.Templates.Password) != "" || len(auth.Parameters) > 0
+}
+
+// baseCredentialChecks enforces that a session-enabled provider has basic auth
+// with non-empty, token-free base credentials.
+func baseCredentialChecks(fieldPath string, auth ProviderAuthConfig) *ValidationErrors {
+	errs := &ValidationErrors{}
+	authType := strings.ToLower(strings.TrimSpace(auth.Type))
+	if authType != "basic" {
+		errs.Add(fieldPath, "requires provider auth type basic")
 		return errs
 	}
-	if err := ValidateUsernameTemplate(template); err != nil {
-		errs.Add(fieldPath+".username_template", err.Error())
+	if strings.TrimSpace(auth.Username) == "" {
+		errs.Add(fieldPath, "requires a base provider auth username without a session suffix")
 	}
-	if !isHTTPSessionCapableProvider(provider) {
-		errs.Add(fieldPath+".mode", "username_template requires an http_proxy compatible provider type")
+	if strings.TrimSpace(auth.Password) == "" {
+		errs.Add(fieldPath, "requires a provider auth password")
 	}
-	// Session identity requires basic upstream auth so the rendered username
-	// has a stable password to pair with.
-	if authType := strings.ToLower(strings.TrimSpace(provider.Auth.Type)); authType != "basic" {
-		errs.Add(fieldPath+".mode", "username_template requires provider auth type basic")
-	} else {
-		if strings.TrimSpace(provider.Auth.Username) == "" {
-			errs.Add(fieldPath+".mode", "username_template requires a base provider auth username without session suffix")
-		}
-		if strings.TrimSpace(provider.Auth.Password) == "" {
-			errs.Add(fieldPath+".mode", "username_template requires a provider auth password")
-		}
-		if strings.Contains(provider.Auth.Username, "{{") || strings.Contains(provider.Auth.Username, "}}") {
-			errs.Add(fieldPath+".mode", "base auth username must not contain template tokens")
-		}
-		if strings.Contains(provider.Auth.Username, "${") {
-			errs.Add(fieldPath+".mode", "base auth username must not contain ${ENV} placeholders; env expansion already ran")
-		}
+	if strings.Contains(auth.Username, "{{") || strings.Contains(auth.Username, "}}") {
+		errs.Add(fieldPath, "base auth username must not contain template tokens")
+	}
+	if strings.Contains(auth.Username, "${") {
+		errs.Add(fieldPath, "base auth username must not contain ${ENV} placeholders; env expansion already ran")
 	}
 	return errs
 }
@@ -1084,7 +1164,7 @@ func (s SessionControlConfig) Validate(fieldPath string, providers map[string]Pr
 	} else if cfg, ok := providers[bound]; !ok {
 		errs.Add(fieldPath+".provider", "must reference an existing provider name")
 	} else if !cfg.Session.SessionEnabled() {
-		errs.Add(fieldPath+".provider", "must reference a provider with session mode username_template enabled")
+		errs.Add(fieldPath+".provider", "must reference a provider with a runtime session mode enabled (username_template or credential_template)")
 	}
 	return errs
 }

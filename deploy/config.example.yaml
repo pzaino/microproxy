@@ -23,6 +23,10 @@ listeners:
     type: http
     address: 0.0.0.0:8080
     provider: corp-http-primary
+    # rate_limit is a per-listener request/second token bucket (burst equal to
+    # the rate). Excess requests receive 429 Too Many Requests with a
+    # Retry-After header. 0/omitted disables limiting; a SOCKS5 listener applies
+    # the same limit per accepted connection.
     rate_limit: 500
     auth_type: basic
     username: ${MICROPROXY_LISTENER_USER}
@@ -247,3 +251,44 @@ observability:
 #   session_control: 127.0.0.1:8094, auth_type bearer, bearer ${MICROPROXY_SESSION_API_KEY}
 #   CROWler: close browser -> POST rotate (Idempotency-Key) -> 200 -> start browser
 #   Latest-key replay: 200 + replayed=true; older key: 409 stale_idempotency_key
+#
+# credential-template (generic, provider-independent):
+#   providers: a credential_template provider renders username and/or password
+#   from base credentials, static parameters and the pinned session id.
+#   - Bright Data-style (username only, password stays base):
+#       providers:
+#         - name: brightdata-geo
+#           type: http_proxy
+#           auth:
+#             type: basic
+#             username: ${BD_USER}
+#             password: ${BD_PASSWORD}
+#             templates:
+#               username: "{{username}}.{{session_id}}{{region}}"
+#             parameters:
+#               region: { source: endpoint.region }
+#           session:
+#             supported: true
+#             mode: credential_template
+#             id: { length: 10, charset: alphanumeric }
+#           endpoints:
+#             - { url: http://gateway.example:8000, country: US, region: FL,
+#                 priority: 100, weight: 3 }
+#   - Evomi-style (password only, username stays base):
+#       auth:
+#         type: basic
+#         username: ${EVOMI_USER}
+#         password: ${EVOMI_PASSWORD}
+#         templates:
+#           password: "{{password}}-{{session_id}}"
+#       session: { supported: true, mode: credential_template }
+#   Notes:
+#   - mode credential_template and the legacy session.username_template are
+#     mutually exclusive; credential_template mode requires a template that
+#     references {{session_id}} and basic upstream auth with non-empty base
+#     credentials.
+#   - templating requires an http_proxy-compatible provider (direct/socks5
+#     rejected); see docs/generic-credential-templates.md.
+#   - session.id configures the sticky identifier (length 1..128, default 32
+#     lowercase hex; charset one of hex, hex_upper, numeric, alpha,
+#     alpha_mixed, alphanumeric, alphanumeric_low, urlsafe).

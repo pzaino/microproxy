@@ -16,10 +16,11 @@ import (
 
 func sessionAdapter() httpProxyAdapter {
 	return httpProxyAdapter{
-		providerName:    "sticky",
-		auth:            config.ProviderAuthConfig{Type: "basic", Username: "zone-user", Password: "zone-pass"},
-		sessionTemplate: "{{username}}-session-{{session_id}}",
-		sessionEnabled:  true,
+		providerName:   "sticky",
+		auth:           config.ProviderAuthConfig{Type: "basic", Username: "zone-user", Password: "zone-pass"},
+		sessionMode:    "username_template",
+		legacyTemplate: "{{username}}-session-{{session_id}}",
+		sessionEnabled: true,
 	}
 }
 
@@ -71,7 +72,7 @@ func TestHTTPProxyAdapter_WrongProviderSnapshotFailsClosed(t *testing.T) {
 func TestHTTPProxyAdapter_RenderFailureFailsClosed(t *testing.T) {
 	t.Parallel()
 	adapter := sessionAdapter()
-	adapter.sessionTemplate = "{{username}}" // invalid: missing {{session_id}}
+	adapter.legacyTemplate = "{{username}}" // invalid: missing {{session_id}}
 	req, _ := http.NewRequest(http.MethodGet, "http://example.com/", nil)
 	ctx := listeners.WithSessionSnapshot(req.Context(), listeners.SessionSnapshot{Provider: "sticky", SessionID: "abc123", Generation: 1})
 	req = req.WithContext(ctx)
