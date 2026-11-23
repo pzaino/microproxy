@@ -29,6 +29,11 @@ If you run multiple `microproxy` instances, you currently need external orchestr
 
 All `/api/v1/*` endpoints except `GET /api/v1/health` require auth.
 
+These credentials authenticate the **control plane only**. They do not
+authenticate the data-plane-local session management API on `127.0.0.1:8094`
+(see `docs/session-control.md`), which has its own `session_control.auth_type`
+and bearer token.
+
 Supported credentials:
 
 - `X-API-Key: <key>`
@@ -66,8 +71,8 @@ Base URL examples:
 - `PUT /api/v1/providers/{providerID}` — full replace (requires `resourceVersion`).
 - `PATCH /api/v1/providers/{providerID}` — partial update for supported fields (`name`, `type`, `endpoint`) and `resourceVersion`.
 - `DELETE /api/v1/providers/{providerID}?resourceVersion=...` (or `If-Match`) — delete with optimistic concurrency.
-- `POST /api/v1/providers/{providerID}/rotate` — async operation stub/contract route.
-- `POST /api/v1/providers/{providerID}/sessions/{sid}/refresh` — async operation stub/contract route.
+- `POST /api/v1/providers/{providerID}/rotate` — async operation stub/contract route. Does NOT rotate data-plane sticky identity; use the data-plane session API (`docs/session-control.md`, `api/session-control.openapi.yaml`, default `127.0.0.1:8094`) for live rotation.
+- `POST /api/v1/providers/{providerID}/sessions/{sid}/refresh` — async operation stub/contract route. Does NOT mutate the running `microproxy` process.
 - `GET /api/v1/providers/{providerID}/capabilities` — provider capability view.
 
 ### 3) Operations (implemented)

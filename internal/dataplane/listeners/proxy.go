@@ -38,6 +38,7 @@ type RouteDecision struct {
 type RuntimeEndpoint struct {
 	URL      *url.URL
 	Priority int
+	Weight   int
 	Adapter  UpstreamAdapter
 	Health   EndpointHealthSnapshot
 }
@@ -111,6 +112,7 @@ type ForwardProxyHandler struct {
 	Selector          EndpointSelector
 	ClassifyTimeoutFn TimeoutClassifier
 	PolicyEvaluator   PolicyEvaluator
+	Sessions          SessionSnapshotProvider
 }
 
 func NewForwardProxyHandler() *ForwardProxyHandler {
@@ -134,6 +136,7 @@ func NewForwardProxyHandlerWithRuntime(runtime RequestRuntime) *ForwardProxyHand
 	handler.Selector = runtime.Selector
 	handler.ClassifyTimeoutFn = runtime.ClassifyTimeoutFn
 	handler.PolicyEvaluator = runtime.PolicyEvaluator
+	handler.Sessions = runtime.Sessions
 	return handler
 }
 
@@ -144,6 +147,7 @@ type RequestRuntime struct {
 	Selector          EndpointSelector
 	ClassifyTimeoutFn TimeoutClassifier
 	PolicyEvaluator   PolicyEvaluator
+	Sessions          SessionSnapshotProvider
 }
 
 func (h *ForwardProxyHandler) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
@@ -179,13 +183,23 @@ func (h *ForwardProxyHandler) handleForward(rw http.ResponseWriter, req *http.Re
 		return
 	}
 	if policyDecision.Action == "route_override" {
-		if overrideEndpoints, ok := h.resolveOverrideEndpoints(req, policyDecision.RouteOverride); ok {
+		if isOverrideBlocked(req.Context(), policyDecision.RouteOverride) {
+			slog.Warn("route override blocked by listener binding", "listener_provider", listenerProviderFromContext(req.Context()), "override", policyDecision.RouteOverride)
+		} else if overrideEndpoints, ok := h.resolveOverrideEndpoints(req, policyDecision.RouteOverride); ok {
 			endpoints = overrideEndpoints
 			UpdateMetadata(req.Context(), func(metadata *RequestMetadata) {
 				metadata.Provider = policyDecision.RouteOverride
 			})
+			decision.Provider = policyDecision.RouteOverride
 		}
+		// Unknown override providers are ignored (legacy behaviour, stays on
+		// the original provider). Required-upstream emptiness still fails
+		// closed in roundTripWithFallback, never via direct egress.
 	}
+
+	// Pin the sticky-session snapshot once per operation so concurrent
+	// rotation cannot mix identities within one request.
+	req = h.pinSession(req, decision.Provider)
 
 	outReq := req.Clone(req.Context())
 	outReq.RequestURI = ""
@@ -208,7 +222,11 @@ func (h *ForwardProxyHandler) handleForward(rw http.ResponseWriter, req *http.Re
 
 	resp, err := h.roundTripWithFallback(outReq, endpoints)
 	if err != nil {
-		http.Error(rw, fmt.Sprintf("proxy request failed: %v", err), http.StatusBadGateway)
+		if isNoUpstreamError(err) {
+			http.Error(rw, fmt.Sprintf("proxy request failed: %v", err), http.StatusBadGateway)
+		} else {
+			http.Error(rw, fmt.Sprintf("proxy request failed: %v", err), http.StatusBadGateway)
+		}
 		return
 	}
 	defer resp.Body.Close()
@@ -227,6 +245,10 @@ func (h *ForwardProxyHandler) handleForward(rw http.ResponseWriter, req *http.Re
 
 func (h *ForwardProxyHandler) roundTripWithFallback(req *http.Request, endpoints []RuntimeEndpoint) (*http.Response, error) {
 	if len(endpoints) == 0 {
+		metadata, _ := MetadataFromContext(req.Context())
+		if RequiresUpstream(req.Context(), metadata.Provider) {
+			return nil, fmt.Errorf("no upstream endpoints available for required provider %q", metadata.Provider)
+		}
 		return h.Transport.RoundTrip(req)
 	}
 
@@ -234,6 +256,10 @@ func (h *ForwardProxyHandler) roundTripWithFallback(req *http.Request, endpoints
 	for i, endpoint := range endpoints {
 		adapter := endpoint.Adapter
 		if adapter == nil {
+			metadata, _ := MetadataFromContext(req.Context())
+			if RequiresUpstream(req.Context(), metadata.Provider) {
+				return nil, fmt.Errorf("no upstream adapter available for required provider %q", metadata.Provider)
+			}
 			adapter = defaultDirectAdapter{}
 		}
 		preparedReq, err := adapter.PrepareRequest(req, endpoint.URL)
@@ -250,12 +276,13 @@ func (h *ForwardProxyHandler) roundTripWithFallback(req *http.Request, endpoints
 		}
 		class := h.classifyTimeout(err)
 		h.observeEndpointOutcome(req.Context(), endpoint.URL, err, class)
-		errs = append(errs, wrapEndpointError(endpoint.URL, err, class))
+		wrappedErr := wrapEndpointError(endpoint.URL, err, class)
+		errs = append(errs, wrappedErr)
 		endpointLabel := "<direct>"
 		if endpoint.URL != nil {
-			endpointLabel = endpoint.URL.String()
+			endpointLabel = redactEndpointUserinfo(endpoint.URL.String(), endpoint.URL)
 		}
-		slog.Warn("forward upstream endpoint failed", "provider", providerFromContext(req.Context()), "endpoint", endpointLabel, "classification", class, "error", err)
+		slog.Warn("forward upstream endpoint failed", "provider", providerFromContext(req.Context()), "endpoint", endpointLabel, "classification", class, "error", wrappedErr)
 	}
 	return nil, errors.Join(errs...)
 }
@@ -290,19 +317,31 @@ func (h *ForwardProxyHandler) handleConnect(rw http.ResponseWriter, req *http.Re
 		return
 	}
 	if policyDecision.Action == "route_override" {
-		if overrideEndpoints, ok := h.resolveOverrideEndpoints(req, policyDecision.RouteOverride); ok {
+		if isOverrideBlocked(req.Context(), policyDecision.RouteOverride) {
+			slog.Warn("route override blocked by listener binding", "listener_provider", listenerProviderFromContext(req.Context()), "override", policyDecision.RouteOverride)
+		} else if overrideEndpoints, ok := h.resolveOverrideEndpoints(req, policyDecision.RouteOverride); ok {
 			endpoints = overrideEndpoints
 			UpdateMetadata(req.Context(), func(metadata *RequestMetadata) {
 				metadata.Provider = policyDecision.RouteOverride
 			})
+			decision.Provider = policyDecision.RouteOverride
 		}
 	}
 
+	// Pin session snapshot for the CONNECT upstream handshake. The established
+	// tunnel keeps this identity; rotation only affects new CONNECTs.
+	connectCtx := h.sessionContext(req.Context(), decision.Provider)
+
 	var targetConn net.Conn
 	if len(endpoints) == 0 {
+		metadata, _ := MetadataFromContext(req.Context())
+		if RequiresUpstream(req.Context(), metadata.Provider) {
+			http.Error(rw, fmt.Sprintf("connect target failed: no upstream endpoints available for required provider %q", metadata.Provider), http.StatusBadGateway)
+			return
+		}
 		targetConn, err = h.Dialer.DialContext(req.Context(), "tcp", targetAddr)
 	} else {
-		targetConn, err = h.dialConnectViaUpstream(req.Context(), targetAddr, endpoints)
+		targetConn, err = h.dialConnectViaUpstream(connectCtx, targetAddr, endpoints)
 	}
 	if err != nil {
 		http.Error(rw, fmt.Sprintf("connect target failed: %v", err), http.StatusBadGateway)
@@ -345,6 +384,10 @@ func (h *ForwardProxyHandler) dialConnectViaUpstream(ctx context.Context, target
 	for _, endpoint := range endpoints {
 		adapter := endpoint.Adapter
 		if adapter == nil {
+			metadata, _ := MetadataFromContext(ctx)
+			if RequiresUpstream(ctx, metadata.Provider) {
+				return nil, fmt.Errorf("no upstream adapter available for required provider %q", metadata.Provider)
+			}
 			adapter = defaultDirectAdapter{}
 		}
 		conn, err := adapter.DialConnect(ctx, targetAddr, endpoint.URL, h.Dialer)
@@ -374,6 +417,19 @@ func (h *ForwardProxyHandler) observeEndpointOutcome(ctx context.Context, endpoi
 
 func (h *ForwardProxyHandler) resolveRoute(req *http.Request) (RouteDecision, []RuntimeEndpoint, bool) {
 	metadata, _ := MetadataFromContext(req.Context())
+	// Hard listener binding wins over client headers and routing rules.
+	if strings.TrimSpace(metadata.ListenerProvider) != "" {
+		bound := strings.TrimSpace(metadata.ListenerProvider)
+		decision := RouteDecision{TenantID: metadata.TenantID, Provider: bound}
+		if h.Registry == nil || h.Selector == nil {
+			return decision, nil, true
+		}
+		provider, ok := h.Registry.Get(bound)
+		if !ok {
+			return decision, nil, true
+		}
+		return decision, h.Selector.Select(req.Context(), provider, req), true
+	}
 	if h.Resolver == nil {
 		return RouteDecision{}, nil, false
 	}
@@ -467,6 +523,54 @@ func providerFromContext(ctx context.Context) string {
 		return "unknown"
 	}
 	return metadata.Provider
+}
+
+func listenerProviderFromContext(ctx context.Context) string {
+	metadata, _ := MetadataFromContext(ctx)
+	return strings.TrimSpace(metadata.ListenerProvider)
+}
+
+func isOverrideBlocked(ctx context.Context, override string) bool {
+	bound := listenerProviderFromContext(ctx)
+	override = strings.TrimSpace(override)
+	if bound == "" || override == "" {
+		return false
+	}
+	return !strings.EqualFold(bound, override)
+}
+
+func isNoUpstreamError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "no upstream")
+}
+
+// pinSession returns req with a pinned sticky-session snapshot when the
+// provider is session-enabled. The same pinned snapshot must be used for the
+// whole operation.
+func (h *ForwardProxyHandler) pinSession(req *http.Request, provider string) *http.Request {
+	ctx := h.sessionContext(req.Context(), provider)
+	if ctx == req.Context() {
+		return req
+	}
+	return req.WithContext(ctx)
+}
+
+func (h *ForwardProxyHandler) sessionContext(ctx context.Context, provider string) context.Context {
+	provider = strings.TrimSpace(provider)
+	if provider == "" || h.Sessions == nil {
+		return ctx
+	}
+	if _, ok := SessionSnapshotFromContext(ctx); ok {
+		return ctx
+	}
+	snapshot, ok := h.Sessions.Snapshot(provider)
+	if !ok {
+		return ctx
+	}
+	return WithSessionSnapshot(ctx, snapshot)
 }
 
 func (h *ForwardProxyHandler) classifyTimeout(err error) TimeoutClassification {
@@ -572,10 +676,68 @@ func (h *ForwardProxyHandler) Shutdown(_ context.Context) error {
 }
 
 func wrapEndpointError(endpoint *url.URL, err error, class TimeoutClassification) error {
+	// Redact any basic-auth userinfo the underlying transport/TLS error may
+	// carry so a wrapped error logged or surfaced to callers never reveals the
+	// upstream credential. The redacted text is frozen in redactedError.Error so
+	// it cannot re-leak when the error is formatted again, while Unwrap keeps
+	// the original error for errors.Is/errors.As classification.
+	inner := &redactedError{cause: redactEndpointUserinfo(errString(err), endpoint), inner: err}
 	if endpoint == nil {
-		return fmt.Errorf("endpoint <direct> failed (%s): %w", class, err)
+		return fmt.Errorf("endpoint <direct> failed (%s): %w", class, inner)
 	}
-	return fmt.Errorf("endpoint %s failed (%s): %w", endpoint, class, err)
+	redactedHost := redactEndpointUserinfo(endpoint.String(), endpoint)
+	return fmt.Errorf("endpoint %s failed (%s): %w", redactedHost, class, inner)
+}
+
+func errString(err error) string {
+	if err == nil {
+		return ""
+	}
+	return err.Error()
+}
+
+// redactedError wraps an error whose printed text may carry basic-auth
+// userinfo. Error() returns the pre-redacted representation so the secret is
+// never re-emitted when the wrapped error is formatted; Unwrap preserves the
+// original error for errors.Is/errors.As.
+type redactedError struct {
+	cause string
+	inner error
+}
+
+func (e *redactedError) Error() string {
+	if e.cause == "" {
+		return "redacted"
+	}
+	return e.cause
+}
+
+func (e *redactedError) Unwrap() error {
+	return e.inner
+}
+
+// redactEndpointUserinfo masks basic-auth userinfo ("user:pass@") that a dial or
+// TLS error string may carry for an upstream endpoint. Only the endpoint's base
+// credentials appear in such transport error text; session-rendered
+// credentials travel in the request body/headers and are not part of dial/TLS
+// error output, so base-userinfo redaction fully covers the exposed values.
+func redactEndpointUserinfo(raw string, endpoint *url.URL) string {
+	if raw == "" || endpoint == nil || endpoint.User == nil {
+		return raw
+	}
+	password, _ := endpoint.User.Password()
+	if password == "" {
+		return raw
+	}
+	token := endpoint.User.String()
+	if token == "" || token == ":" {
+		return raw
+	}
+	masked := strings.TrimSuffix(token, ":"+password) + ":****"
+	// Mask the canonical "user:pass@host" form first, then a bare token, so the
+	// secret never survives either with or without the closing "@".
+	raw = strings.ReplaceAll(raw, token+"@", masked+"@")
+	return strings.ReplaceAll(raw, token, masked)
 }
 
 func timeoutForAttempt(base time.Duration, attempt int) time.Duration {

@@ -13,6 +13,9 @@ type contextKey string
 const metadataContextKey contextKey = "request-metadata"
 
 // RequestMetadata carries per-request values for future routing/observability.
+// ListenerName/Provider are trusted values injected from the listening server
+// itself. TenantID/Provider initially come from downstream headers and are
+// untrusted until a hard listener binding overrides Provider.
 type RequestMetadata struct {
 	RequestID       string
 	TenantID        string
@@ -26,6 +29,11 @@ type RequestMetadata struct {
 	RequestSize     int64
 	ResponseSize    int64
 	EvaluationClock time.Time
+	// ListenerName is the trusted accepting listener name (empty if unknown).
+	ListenerName string
+	// ListenerProvider is the trusted hard binding for the accepting listener.
+	// Empty means legacy routing (no mandatory egress constraint).
+	ListenerProvider string
 }
 
 type metadataRef struct {
@@ -72,6 +80,55 @@ func MetadataMiddleware(next http.Handler) http.Handler {
 		}
 		next.ServeHTTP(rw, req.WithContext(WithMetadata(req.Context(), metadata)))
 	})
+}
+
+// ListenerBindingMiddleware injects the trusted listener identity/binding
+// from the accepting server itself, not client headers. When provider is
+// non-empty it hard-overrides any client-supplied X-Provider-ID so header
+// spoofing cannot escape the binding.
+func ListenerBindingMiddleware(listenerName, provider string, next http.Handler) http.Handler {
+	if next == nil {
+		next = http.HandlerFunc(func(http.ResponseWriter, *http.Request) {})
+	}
+	return http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+		ctx := req.Context()
+		if _, ok := MetadataFromContext(ctx); !ok {
+			ctx = WithMetadata(ctx, RequestMetadata{RequestID: requestIDFromRequest(req)})
+		}
+		UpdateMetadata(ctx, func(metadata *RequestMetadata) {
+			metadata.ListenerName = listenerName
+			metadata.ListenerProvider = provider
+			if provider != "" {
+				metadata.Provider = provider
+			}
+		})
+		next.ServeHTTP(rw, req.WithContext(ctx))
+	})
+}
+
+// ListenerBindingFromContext returns the trusted listener name/binding.
+func ListenerBindingFromContext(ctx context.Context) (name, provider string, ok bool) {
+	metadata, found := MetadataFromContext(ctx)
+	if !found {
+		return "", "", false
+	}
+	if metadata.ListenerName == "" && metadata.ListenerProvider == "" {
+		return "", "", false
+	}
+	return metadata.ListenerName, metadata.ListenerProvider, true
+}
+
+// RequiresUpstream reports whether egress must use an explicit upstream
+// provider (fail closed) rather than legacy direct fallback. A hard listener
+// binding always requires upstream; otherwise any resolved provider name
+// requires upstream.
+func RequiresUpstream(ctx context.Context, provider string) bool {
+	if metadata, ok := MetadataFromContext(ctx); ok {
+		if metadata.ListenerProvider != "" {
+			return true
+		}
+	}
+	return provider != ""
 }
 
 func requestIDFromRequest(req *http.Request) string {

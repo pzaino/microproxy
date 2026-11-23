@@ -67,13 +67,41 @@ const (
 )
 
 func NewRequestRuntime(cfg *config.Config) listeners.RequestRuntime {
+	manager, err := NewSessionManager(cfg)
+	if err != nil {
+		// The error-aware constructors surface this failure at startup.
+		// Without a live manager, session-enabled providers fail closed at
+		// request time instead of silently using the base username.
+		manager = nil
+	}
+	return NewRequestRuntimeWithSessionManager(cfg, manager)
+}
+
+// NewRequestRuntimeE builds the request runtime plus the shared session manager.
+// It returns an error when sticky-session identities cannot be generated.
+func NewRequestRuntimeE(cfg *config.Config) (listeners.RequestRuntime, error) {
+	manager, err := NewSessionManager(cfg)
+	if err != nil {
+		return listeners.RequestRuntime{}, err
+	}
+	return NewRequestRuntimeWithSessionManager(cfg, manager), nil
+}
+
+// NewRequestRuntimeWithSessionManager builds a runtime sharing the given live
+// session manager instance (same process, same identities as the management API).
+func NewRequestRuntimeWithSessionManager(cfg *config.Config, manager *SessionManager) listeners.RequestRuntime {
 	registry := NewProviderRegistry(cfg)
+	var sessions listeners.SessionSnapshotProvider
+	if manager != nil {
+		sessions = manager
+	}
 	return listeners.RequestRuntime{
 		Resolver:          NewRouteResolver(cfg),
 		Registry:          registry,
 		Selector:          NewEndpointSelector(registry),
 		ClassifyTimeoutFn: ClassifyTimeout,
 		PolicyEvaluator:   policy.NewEngine(cfg),
+		Sessions:          sessions,
 	}
 }
 
@@ -90,15 +118,17 @@ func NewRouteResolver(cfg *config.Config) *RouteResolver {
 	return &RouteResolver{defaultProvider: strings.TrimSpace(cfg.Routing.DefaultProvider), rules: append([]config.RoutingRule{}, cfg.Routing.Rules...)}
 }
 
-func (r *RouteResolver) Resolve(_ *http.Request, metadata listeners.RequestMetadata) (listeners.RouteDecision, error) {
+func (r *RouteResolver) Resolve(req *http.Request, metadata listeners.RequestMetadata) (listeners.RouteDecision, error) {
 	decision := listeners.RouteDecision{TenantID: metadata.TenantID}
 	if provider := strings.TrimSpace(metadata.Provider); provider != "" {
 		decision.Provider = provider
 		return decision, nil
 	}
 
+	targetHost := targetHost(req)
+
 	for _, rule := range r.rules {
-		if matchesRule(rule.Match, metadata) {
+		if matchesRule(rule.Match, metadata, targetHost) {
 			decision.Provider = rule.Provider
 			decision.Policy = rule.PolicyRef
 			if decision.Provider != "" {
@@ -114,10 +144,28 @@ func (r *RouteResolver) Resolve(_ *http.Request, metadata listeners.RequestMetad
 	return decision, nil
 }
 
-func matchesRule(match map[string]string, metadata listeners.RequestMetadata) bool {
+// targetHost returns the proxy target host name (bare name, port stripped) for a
+// forward-proxy or CONNECT request. It falls back to the request Host header when
+// the URL has no host. Used to evaluate host-family routing match keys.
+func targetHost(req *http.Request) string {
+	if req == nil {
+		return ""
+	}
+	if h := req.URL.Hostname(); h != "" {
+		return h
+	}
+	host := req.Host
+	if i := strings.IndexByte(host, ':'); i >= 0 {
+		host = host[:i]
+	}
+	return host
+}
+
+func matchesRule(match map[string]string, metadata listeners.RequestMetadata, targetHost string) bool {
 	if len(match) == 0 {
 		return false
 	}
+	lowerHost := strings.ToLower(targetHost)
 	for key, value := range match {
 		switch strings.ToLower(strings.TrimSpace(key)) {
 		case "tenant", "tenant_id", "tenantid":
@@ -126,6 +174,18 @@ func matchesRule(match map[string]string, metadata listeners.RequestMetadata) bo
 			}
 		case "provider", "provider_id", "providerid":
 			if metadata.Provider != value {
+				return false
+			}
+		case "host":
+			if lowerHost != strings.ToLower(strings.TrimSpace(value)) {
+				return false
+			}
+		case "host_prefix":
+			if !strings.HasPrefix(lowerHost, strings.ToLower(strings.TrimSpace(value))) {
+				return false
+			}
+		case "host_suffix":
+			if !strings.HasSuffix(lowerHost, strings.ToLower(strings.TrimSpace(value))) {
 				return false
 			}
 		default:
@@ -158,7 +218,6 @@ func NewProviderRegistry(cfg *config.Config) *ProviderRegistry {
 
 	for _, provider := range cfg.Providers {
 		runtimeProvider := RuntimeProvider{Name: provider.Name}
-		adapter := adapterFactory.ForProvider(provider)
 		providerHealth := normalizeHealthConfig(provider.Health)
 		registry.health[provider.Name] = map[string]*endpointHealthState{}
 		for _, endpoint := range provider.Endpoints {
@@ -166,6 +225,11 @@ func NewProviderRegistry(cfg *config.Config) *ProviderRegistry {
 			if err != nil || parsed.Scheme == "" || parsed.Host == "" {
 				continue
 			}
+			// Build a per-endpoint adapter so that credential templates which
+			// read endpoint.country / endpoint.region resolve against this
+			// endpoint's static metadata. The shared auth renderer decisions are
+			// built once and the per-endpoint metadata is closed over.
+			adapter := adapterFactory.ForProviderEndpoint(provider, endpoint)
 			endpointState := newEndpointHealthState(providerHealth)
 			registry.health[provider.Name][describeEndpoint(parsed)] = endpointState
 			runtimeProvider.Endpoints = append(runtimeProvider.Endpoints, RuntimeEndpoint{
@@ -204,6 +268,7 @@ func (r *ProviderRegistry) Get(provider string) (listeners.RuntimeProvider, bool
 		endpoints = append(endpoints, listeners.RuntimeEndpoint{
 			URL:      ep.URL,
 			Priority: ep.Priority,
+			Weight:   ep.Weight,
 			Adapter:  ep.Adapter,
 			Health: listeners.EndpointHealthSnapshot{
 				State:         string(snapshot.State),
@@ -307,10 +372,18 @@ func (s *EndpointSelector) Select(_ context.Context, provider listeners.RuntimeP
 	sort.SliceStable(ordered, func(i, j int) bool {
 		left := providerPriority(provider, ordered[i])
 		right := providerPriority(provider, ordered[j])
-		if left == right {
-			return describeEndpoint(ordered[i].URL) < describeEndpoint(ordered[j].URL)
+		if left != right {
+			return left < right
 		}
-		return left < right
+		// Within a priority tier the configured weight decides the failover
+		// order: a higher weight is tried first. An unconfigured or non-positive
+		// weight defaults to 1 so a configured endpoint is never starved by an
+		// unconfigured neighbour.
+		li, lj := endpointWeight(ordered[i]), endpointWeight(ordered[j])
+		if li != lj {
+			return li > lj
+		}
+		return describeEndpoint(ordered[i].URL) < describeEndpoint(ordered[j].URL)
 	})
 	if s.registry == nil {
 		return ordered
@@ -322,6 +395,16 @@ func (s *EndpointSelector) Select(_ context.Context, provider listeners.RuntimeP
 		}
 	}
 	return filtered
+}
+
+// endpointWeight returns the selection weight, defaulting to 1 for endpoints that
+// omit a weight or configure a non-positive one so weighted selection never
+// starves an unconfigured endpoint.
+func endpointWeight(endpoint listeners.RuntimeEndpoint) int {
+	if endpoint.Weight > 0 {
+		return endpoint.Weight
+	}
+	return 1
 }
 
 func providerPriority(provider listeners.RuntimeProvider, endpoint listeners.RuntimeEndpoint) int {

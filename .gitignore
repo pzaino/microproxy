@@ -6,6 +6,7 @@ attic/
 do.patch
 controlplane.env
 config.yaml
+coverage.out
 
 # old files
 *.old

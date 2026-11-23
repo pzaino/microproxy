@@ -1,0 +1,194 @@
+openapi: 3.1.0
+info:
+  title: MicroProxy Data-Plane Session Control API
+  version: 1.0.0
+  description: |
+    local authenticated API served by the running `microproxy` data-plane
+    process (default 127.0.0.1:8094). Distinct from the `microproxy-control`
+    control-plane contract in api/controlplane.openapi.yaml, whose provider
+    rotate/refresh routes are async stubs and do not mutate data-plane sticky
+    identity.
+
+    Authentication is configured with `session_control.auth_type`: `bearer`
+    (the default when omitted) requires `Authorization: Bearer <token>` with a
+    non-empty `bearer_token`; `none` permits unauthenticated loopback access
+    only unless `allow_unauthenticated_non_loopback: true` is explicitly set.
+    Listener `auth_type` protects downstream proxy clients and is unrelated.
+servers:
+  - url: http://127.0.0.1:8094
+paths:
+  /api/v1/sessions/rotate:
+    post:
+      summary: Rotate sticky upstream session
+      operationId: rotateStickySession
+      description: |
+        Atomically commits a new upstream proxy sticky/persistent-session identity 
+        for the configured provider. New HTTP requests and CONNECT tunnels starting
+        after the commit use the new credentials; established tunnels are
+        preserved. Caller must close the old browser before calling and start
+        the next browser only after 200.
+
+        Replaying the latest accepted Idempotency-Key while it is still
+        retained returns 200 with the original generation and `replayed: true`,
+        without a new identity or connection cleanup. Reusing a retained older
+        key returns 409 `stale_idempotency_key` with the original and current
+        generations. Keys evicted beyond the bounded retention window
+        (512 entries, 24h) are treated as new rotations.
+      parameters:
+        - name: Authorization
+          in: header
+          required: false
+          schema:
+            type: string
+          description: |
+            `Bearer <MICROPROXY_SESSION_API_KEY>`. Required when
+            `session_control.auth_type` is `bearer` (the default); ignored when
+            it is `none`.
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema:
+            type: string
+            minLength: 1
+            maxLength: 256
+          description: |
+            Unique caller job-boundary id. Latest-key replay returns the prior
+            generation; a retained older key returns 409. Evicted keys start a
+            new rotation.
+      responses:
+        '200':
+          description: New rotation, or latest-key replay with replayed=true.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RotateResponse'
+        '400':
+          description: Malformed request or idempotency key.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '401':
+          description: Missing, invalid or malformed bearer credentials.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '405':
+          description: Method must be POST.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '409':
+          description: Retained idempotency key was superseded by a newer rotation.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StaleIdempotencyKeyResponse'
+        '503':
+          description: Identity generation failed; previous state preserved.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+  /api/v1/sessions/status:
+    get:
+      summary: Sticky/persistent session status
+      operationId: getStickySessionStatus
+      description: |
+        Authenticated in bearer mode. Returns provider/generation only and never
+        exposes the session identity.
+      parameters:
+        - name: Authorization
+          in: header
+          required: false
+          schema:
+            type: string
+          description: Required in bearer mode; ignored when auth_type is none.
+      responses:
+        '200':
+          description: Current generation.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/StatusResponse'
+        '401':
+          description: Missing, invalid or malformed bearer credentials.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+        '405':
+          description: Method must be GET.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorEnvelope'
+components:
+  schemas:
+    RotateResponse:
+      type: object
+      required: [status, provider, generation]
+      properties:
+        status:
+          type: string
+          example: rotated
+        provider:
+          type: string
+          example: proxyservice-residential-sticky
+        generation:
+          type: integer
+          format: int64
+          example: 2
+        replayed:
+          type: boolean
+          description: |
+            Present as true only when the latest Idempotency-Key is replayed.
+            The generation is the original generation and no new identity is
+            created.
+          example: true
+    StaleIdempotencyKeyResponse:
+      type: object
+      required: [error, provider, original_generation, current_generation]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code:
+              type: string
+              const: stale_idempotency_key
+            message:
+              type: string
+        provider:
+          type: string
+        original_generation:
+          type: integer
+          format: int64
+          description: Generation committed by the stale key.
+        current_generation:
+          type: integer
+          format: int64
+          description: Current provider generation; identity is unchanged.
+    StatusResponse:
+      type: object
+      required: [provider, generation]
+      properties:
+        provider:
+          type: string
+        generation:
+          type: integer
+          format: int64
+    ErrorEnvelope:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: object
+          required: [code, message]
+          properties:
+            code:
+              type: string
+            message:
+              type: string
