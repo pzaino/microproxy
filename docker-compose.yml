@@ -1,39 +1,84 @@
+# One MicroProxy data plane per CROWler VDI.
+#
+# Copy the examples before starting:
+#   cp deploy/config.vdi.container.example.yaml ./config.yaml
+#   cp deploy/vdi.env.example ./vdi.env
+#   cp deploy/controlplane.env.example ./controlplane.env
+#
+# The data-plane ports are deliberately not published. Sibling containers reach
+# the sticky proxy at http://microproxy:8081 and the authenticated session API
+# at http://microproxy:8094 over the private compose network. Never publish
+# 8094 publicly: it mutates the VDI's upstream sticky identity.
+#
+# Use a separate compose project (or a separate host/network) for each VDI.
 services:
   microproxy:
     build:
       context: .
       dockerfile: Dockerfile.mp
     image: microproxy:local
-    container_name: microproxy
     restart: unless-stopped
-    ports:
-      - "8084:8080" # downstream rotating proxy listener (:8080)
-      - "8086:8081" # downstream sticky proxy listener (:8081, session-managed)
-      - "8094:8094" # data-plane session management API (loopback/private only, authenticated)
-      - "8090:8090" # liveness
-      - "8091:8091" # metrics
-      - "8092:8092" # readiness
-      - "8093:8093" # startup
+    expose:
+      - "8080" # rotating downstream proxy
+      - "8081" # sticky downstream proxy
+      - "8094" # data-plane session API (private network only)
+      - "9090" # liveness
+      - "9091" # metrics
+      - "9092" # readiness
+      - "9093" # startup
     env_file:
-      - ./controlplane.env
-      #- ../thecrowler/.env
-    environment:
-      MICROPROXY_DEVELOPMENT_MODE: "true"
+      - ./vdi.env
     volumes:
       - ./config.yaml:/etc/microproxy/config.yaml:ro
-    command: ["-config", "/etc/microproxy/config.yaml", "-health-addr", ":8090"]
+    command: ["-config", "/etc/microproxy/config.yaml"]
+    networks:
+      - microproxy-vdi
 
   microproxy-control:
     build:
       context: .
       dockerfile: Dockerfile.mp-ctrl
     image: microproxy-control:local
-    container_name: microproxy-control
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8085:8081" # operator-only control API, never the rotation path
     env_file:
       - ./controlplane.env
-      #- ../thecrowler/.env
-    ports:
-      - "8085:8081" # control-plane API
+      - ./vdi.env # the same config must validate; provider creds are not used by the API
     volumes:
       - ./config.yaml:/etc/microproxy/config.yaml:ro
     command: ["-config", "/etc/microproxy/config.yaml", "-listen-addr", ":8081"]
+    networks:
+      - microproxy-vdi
+
+  # Opt-in reachability check from a distinct container namespace:
+  #   docker compose --profile smoke run --rm vdi-smoke
+  vdi-smoke:
+    image: curlimages/curl:8.11.0
+    profiles: ["smoke"]
+    depends_on:
+      - microproxy
+    networks:
+      - microproxy-vdi
+    env_file:
+      - ./vdi.env
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        set -eu
+        base="http://microproxy:8094"
+        token="$${MICROPROXY_SESSION_API_KEY}"
+        for attempt in $$(seq 1 60); do
+          if curl -fsS -H "Authorization: Bearer $$token" "$$base/api/v1/sessions/status" >/tmp/status.json; then
+            break
+          fi
+          sleep 1
+        done
+        cat /tmp/status.json
+        curl -fsS -X POST -H "Authorization: Bearer $$token" \
+          -H "Idempotency-Key: compose-smoke-$$(date +%s)" \
+          "$$base/api/v1/sessions/rotate"
+
+networks:
+  microproxy-vdi:
+    driver: bridge

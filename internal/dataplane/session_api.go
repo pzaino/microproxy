@@ -15,6 +15,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/pzaino/microproxy/internal/observability"
 	"github.com/pzaino/microproxy/pkg/config"
 )
 
@@ -195,22 +196,26 @@ func parseBearerCredential(header string) (string, bool) {
 
 func (s *SessionAPIServer) handleRotate(rw http.ResponseWriter, req *http.Request) {
 	if req.Method != http.MethodPost {
+		s.recordSessionOutcome(observability.SessionOutcomeInvalid)
 		writeSessionError(rw, http.StatusMethodNotAllowed, "method_not_allowed", "method must be POST")
 		return
 	}
 	if !s.checkAuth(req) {
+		s.recordSessionOutcome(observability.SessionOutcomeUnauthorized)
 		writeSessionError(rw, http.StatusUnauthorized, "unauthorized", "missing or invalid credentials")
 		return
 	}
 	// Bound body size; rotation takes no payload.
 	req.Body = http.MaxBytesReader(rw, req.Body, sessionAPIMaxBodyBytes)
 	if _, err := io.Copy(io.Discard, req.Body); err != nil {
+		s.recordSessionOutcome(observability.SessionOutcomeInvalid)
 		writeSessionError(rw, http.StatusBadRequest, "invalid_request", "request body too large or unreadable")
 		return
 	}
 	_ = req.Body.Close()
 	key := strings.TrimSpace(req.Header.Get("Idempotency-Key"))
 	if err := ValidateIdempotencyKey(key); err != nil {
+		s.recordSessionOutcome(observability.SessionOutcomeInvalid)
 		writeSessionError(rw, http.StatusBadRequest, "invalid_request", err.Error())
 		return
 	}
@@ -221,6 +226,7 @@ func (s *SessionAPIServer) handleRotate(rw http.ResponseWriter, req *http.Reques
 		if errors.As(err, &stale) {
 			// The key was committed by an older rotation. Never mutate identity
 			// or close upstream connections for a superseded request.
+			s.recordSessionOutcome(observability.SessionOutcomeStale)
 			slog.Info("session rotation rejected as stale idempotency key",
 				"provider", provider,
 				"original_generation", stale.OriginalGeneration,
@@ -240,14 +246,17 @@ func (s *SessionAPIServer) handleRotate(rw http.ResponseWriter, req *http.Reques
 			return
 		}
 		if strings.Contains(strings.ToLower(err.Error()), "idempotency") || strings.Contains(strings.ToLower(err.Error()), "cannot be empty") || strings.Contains(strings.ToLower(err.Error()), "too long") || strings.Contains(strings.ToLower(err.Error()), "unsupported character") || strings.Contains(strings.ToLower(err.Error()), "printable") {
+			s.recordSessionOutcome(observability.SessionOutcomeInvalid)
 			writeSessionError(rw, http.StatusBadRequest, "invalid_request", err.Error())
 			return
 		}
 		if strings.Contains(strings.ToLower(err.Error()), "no active session") {
+			s.recordSessionOutcome(observability.SessionOutcomeFailed)
 			writeSessionError(rw, http.StatusBadRequest, "invalid_request", "sticky provider has no active session identity")
 			return
 		}
 		// RNG or generation failure: no state change.
+		s.recordSessionOutcome(observability.SessionOutcomeFailed)
 		slog.Error("session rotation failed", "provider", provider, "generation_preserved", true)
 		writeSessionError(rw, http.StatusServiceUnavailable, "rotation_failed", "failed to generate a new session identity")
 		return
@@ -255,11 +264,13 @@ func (s *SessionAPIServer) handleRotate(rw http.ResponseWriter, req *http.Reques
 	if replayed {
 		// Idempotent replay: the identity and generation are unchanged, so the
 		// rotation callback (connection cleanup) must not run again.
+		s.recordSessionOutcome(observability.SessionOutcomeReplayed)
 		slog.Info("session rotation replayed", "provider", provider, "generation", snapshot.Generation)
 	} else {
 		if s.onRotate != nil {
 			s.onRotate()
 		}
+		s.recordSessionOutcome(observability.SessionOutcomeRotated)
 		// Safe audit log: provider + generation only, never identity/username.
 		slog.Info("session rotated", "provider", provider, "generation", snapshot.Generation)
 	}
@@ -297,6 +308,17 @@ func (s *SessionAPIServer) handleStatus(rw http.ResponseWriter, req *http.Reques
 		"provider":   provider,
 		"generation": generation,
 	})
+}
+
+// recordSessionOutcome records a fixed-vocabulary, provider-scoped counter. The
+// provider name comes from configuration; keys, identities and credentials are
+// never metric labels.
+func (s *SessionAPIServer) recordSessionOutcome(outcome string) {
+	provider := ""
+	if s != nil {
+		provider = s.cfg.Provider
+	}
+	observability.RecordSessionOutcome(provider, outcome)
 }
 
 func writeSessionError(rw http.ResponseWriter, status int, code, message string) {

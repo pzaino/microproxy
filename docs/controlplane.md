@@ -159,4 +159,11 @@ curl -sS -X POST -H "X-API-Key: $API_KEY" -H 'Content-Type: application/json' \
 
 If you need independent per-proxy runtime control, deploy one `microproxy-control` alongside each `microproxy` instance and target each control API endpoint explicitly.
 
+Sticky-session rotation for CROWler is **not** part of that control API. It runs
+on the data-plane process itself (`docs/session-control.md`). With the
+one-microproxy-per-VDI topology, CROWler calls
+`http://<that-VDI-microproxy>:8094/api/v1/sessions/rotate`; a sibling container
+reaches it over the private network, while a host run uses
+`http://127.0.0.1:8094`. Do not route rotation through `microproxy-control`.
+
 If you need fleet-wide control from one place, add an external orchestrator layer (your own service or deployment tooling) that fans out API/config operations across instances.

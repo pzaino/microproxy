@@ -259,19 +259,89 @@ type histogramState struct {
 	count  uint64
 }
 
+// Session rotation outcomes are a fixed, low-cardinality vocabulary. Callers
+// must use these values so a configuration or request cannot introduce an
+// unbounded metric label.
+const (
+	SessionOutcomeRotated      = "rotated"
+	SessionOutcomeReplayed     = "replayed"
+	SessionOutcomeStale        = "stale"
+	SessionOutcomeUnauthorized = "unauthorized"
+	SessionOutcomeInvalid      = "invalid"
+	SessionOutcomeFailed       = "failed"
+)
+
+const (
+	EndpointOutcomeSuccess = "success"
+	EndpointOutcomeFailure = "failure"
+)
+
+type sessionMetricKey struct {
+	provider string
+	outcome  string
+}
+
+type endpointMetricKey struct {
+	provider string
+	endpoint string
+	outcome  string
+}
+
 type metricsStore struct {
 	mu sync.Mutex
 
-	requestTotal   map[string]uint64
-	requestLatency map[string]*histogramState
+	requestTotal     map[string]uint64
+	requestLatency   map[string]*histogramState
+	sessionOutcomes  map[sessionMetricKey]uint64
+	endpointOutcomes map[endpointMetricKey]uint64
 }
 
 func newMetricsStore() *metricsStore {
 	bounds := []float64{0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10}
 	return &metricsStore{
-		requestTotal:   map[string]uint64{},
-		requestLatency: map[string]*histogramState{"": {bounds: bounds, counts: make([]uint64, len(bounds)+1)}},
+		requestTotal:     map[string]uint64{},
+		requestLatency:   map[string]*histogramState{"": {bounds: bounds, counts: make([]uint64, len(bounds)+1)}},
+		sessionOutcomes:  map[sessionMetricKey]uint64{},
+		endpointOutcomes: map[endpointMetricKey]uint64{},
 	}
+}
+
+// RecordSessionOutcome increments the low-cardinality rotation outcome counter.
+// It never receives idempotency keys, session identifiers or credentials.
+func RecordSessionOutcome(provider, outcome string) {
+	defaultMetrics.recordSessionOutcome(provider, outcome)
+}
+
+func (m *metricsStore) recordSessionOutcome(provider, outcome string) {
+	provider = valueOrDefault(strings.TrimSpace(provider), "unknown")
+	switch outcome {
+	case SessionOutcomeRotated, SessionOutcomeReplayed, SessionOutcomeStale,
+		SessionOutcomeUnauthorized, SessionOutcomeInvalid, SessionOutcomeFailed:
+	default:
+		outcome = SessionOutcomeFailed
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.sessionOutcomes[sessionMetricKey{provider: provider, outcome: outcome}]++
+}
+
+// RecordEndpointOutcome increments upstream endpoint connectivity counters.
+// endpoint must be a configuration-derived host name, never a credential,
+// session identity or client-controlled value.
+func RecordEndpointOutcome(provider, endpoint string, err error) {
+	defaultMetrics.recordEndpointOutcome(provider, endpoint, err)
+}
+
+func (m *metricsStore) recordEndpointOutcome(provider, endpoint string, err error) {
+	provider = valueOrDefault(strings.TrimSpace(provider), "unknown")
+	endpoint = valueOrDefault(strings.TrimSpace(endpoint), "direct")
+	outcome := EndpointOutcomeSuccess
+	if err != nil {
+		outcome = EndpointOutcomeFailure
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.endpointOutcomes[endpointMetricKey{provider: provider, endpoint: endpoint, outcome: outcome}]++
 }
 
 func (m *metricsStore) observe(method string, status int, provider, tenant, policyAction, policyReason string, latency time.Duration) {
@@ -332,6 +402,49 @@ func (m *metricsStore) handlePrometheus(rw http.ResponseWriter, _ *http.Request)
 		line := fmt.Sprintf(
 			"microproxy_policy_decisions_total{provider=%q,tenant=%q,policy_action=%q,policy_reason=%q} %d\n",
 			escapeLabel(parts[2]), escapeLabel(parts[3]), escapeLabel(parts[4]), escapeLabel(parts[5]), m.requestTotal[key],
+		)
+		_, _ = rw.Write([]byte(line))
+	}
+
+	_, _ = rw.Write([]byte("# HELP microproxy_session_rotations_total Sticky-session rotation outcomes.\n"))
+	_, _ = rw.Write([]byte("# TYPE microproxy_session_rotations_total counter\n"))
+	sessionKeys := make([]sessionMetricKey, 0, len(m.sessionOutcomes))
+	for key := range m.sessionOutcomes {
+		sessionKeys = append(sessionKeys, key)
+	}
+	sort.Slice(sessionKeys, func(i, j int) bool {
+		if sessionKeys[i].provider != sessionKeys[j].provider {
+			return sessionKeys[i].provider < sessionKeys[j].provider
+		}
+		return sessionKeys[i].outcome < sessionKeys[j].outcome
+	})
+	for _, key := range sessionKeys {
+		line := fmt.Sprintf(
+			"microproxy_session_rotations_total{provider=%q,outcome=%q} %d\n",
+			escapeLabel(key.provider), escapeLabel(key.outcome), m.sessionOutcomes[key],
+		)
+		_, _ = rw.Write([]byte(line))
+	}
+
+	_, _ = rw.Write([]byte("# HELP microproxy_upstream_endpoint_attempts_total Upstream endpoint connectivity outcomes.\n"))
+	_, _ = rw.Write([]byte("# TYPE microproxy_upstream_endpoint_attempts_total counter\n"))
+	endpointKeys := make([]endpointMetricKey, 0, len(m.endpointOutcomes))
+	for key := range m.endpointOutcomes {
+		endpointKeys = append(endpointKeys, key)
+	}
+	sort.Slice(endpointKeys, func(i, j int) bool {
+		if endpointKeys[i].provider != endpointKeys[j].provider {
+			return endpointKeys[i].provider < endpointKeys[j].provider
+		}
+		if endpointKeys[i].endpoint != endpointKeys[j].endpoint {
+			return endpointKeys[i].endpoint < endpointKeys[j].endpoint
+		}
+		return endpointKeys[i].outcome < endpointKeys[j].outcome
+	})
+	for _, key := range endpointKeys {
+		line := fmt.Sprintf(
+			"microproxy_upstream_endpoint_attempts_total{provider=%q,endpoint=%q,outcome=%q} %d\n",
+			escapeLabel(key.provider), escapeLabel(key.endpoint), escapeLabel(key.outcome), m.endpointOutcomes[key],
 		)
 		_, _ = rw.Write([]byte(line))
 	}

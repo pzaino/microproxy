@@ -320,6 +320,121 @@ func TestSessionManager_ConcurrentRotateRaceSafe(t *testing.T) {
 	}
 }
 
+func TestSessionManager_RotationRetriesDuplicateIdentity(t *testing.T) {
+	t.Parallel()
+	cfg := stickyTestConfig()
+	cfg.Providers[0].Session.ID = config.SessionIDConfig{Length: 1, Charset: "numeric"}
+	var mu sync.Mutex
+	calls := 0
+	// The first call seeds generation 1 with "1". The first rotation attempt
+	// also produces "1" (a collision), the second produces "2".
+	randFn := func(n int) ([]byte, error) {
+		mu.Lock()
+		defer mu.Unlock()
+		calls++
+		value := byte(0x01)
+		if calls >= 3 {
+			value = 0x02
+		}
+		b := make([]byte, n)
+		for i := range b {
+			b[i] = value
+		}
+		return b, nil
+	}
+	m, err := NewSessionManagerWithRand(cfg, randFn, time.Now)
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	before, _ := m.Snapshot("sticky")
+	if before.SessionID != "1" {
+		t.Fatalf("expected seeded id 1, got %q", before.SessionID)
+	}
+	after, replayed, err := m.Rotate("sticky", "collision-retry")
+	if err != nil {
+		t.Fatalf("rotate with retryable collision: %v", err)
+	}
+	if replayed {
+		t.Fatal("new key must not be reported as replay")
+	}
+	if after.SessionID == before.SessionID {
+		t.Fatalf("rotation must change identity, still %q", after.SessionID)
+	}
+	if after.SessionID != "2" || after.Generation != 2 {
+		t.Fatalf("expected generation 2 id 2, got %+v", after)
+	}
+}
+
+func TestSessionManager_RotationFailsClosedWhenIdentityCannotChange(t *testing.T) {
+	t.Parallel()
+	cfg := stickyTestConfig()
+	cfg.Providers[0].Session.ID = config.SessionIDConfig{Length: 1, Charset: "numeric"}
+	calls := 0
+	randFn := func(n int) ([]byte, error) {
+		calls++
+		b := make([]byte, n)
+		for i := range b {
+			b[i] = 0x01
+		}
+		return b, nil
+	}
+	m, err := NewSessionManagerWithRand(cfg, randFn, time.Now)
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	before, _ := m.Snapshot("sticky")
+	if _, _, err := m.Rotate("sticky", "collision-exhausted"); err == nil {
+		t.Fatal("expected rotation to fail when every candidate duplicates the current identity")
+	}
+	after, _ := m.Snapshot("sticky")
+	if after != before {
+		t.Fatalf("failed rotation must preserve state %+v vs %+v", before, after)
+	}
+	if calls != 1+maxSessionIDGenerationAttempts {
+		t.Fatalf("expected one seed plus %d rotation attempts, got %d", maxSessionIDGenerationAttempts, calls)
+	}
+}
+
+func TestSessionManager_ConcurrentSameKeyRotatesOnce(t *testing.T) {
+	t.Parallel()
+	m, err := NewSessionManager(stickyTestConfig())
+	if err != nil {
+		t.Fatalf("new manager: %v", err)
+	}
+	const workers = 16
+	var wg sync.WaitGroup
+	replayed := make([]bool, workers)
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			snapshot, wasReplay, err := m.Rotate("sticky", "same-job-boundary")
+			if err != nil {
+				t.Errorf("worker %d: %v", idx, err)
+				return
+			}
+			replayed[idx] = wasReplay
+			if snapshot.Generation != 2 {
+				t.Errorf("worker %d: expected generation 2, got %d", idx, snapshot.Generation)
+			}
+		}(i)
+	}
+	wg.Wait()
+	current, _ := m.Snapshot("sticky")
+	if current.Generation != 2 {
+		t.Fatalf("same key must rotate exactly once, generation is %d", current.Generation)
+	}
+	accepted := 0
+	for _, wasReplay := range replayed {
+		if !wasReplay {
+			accepted++
+		}
+	}
+	if accepted != 1 {
+		t.Fatalf("expected exactly one accepted rotation, got %d", accepted)
+	}
+}
+
 func TestSessionManager_ConcurrentSnapshotAndRotate(t *testing.T) {
 	t.Parallel()
 	m, err := NewSessionManager(stickyTestConfig())

@@ -31,10 +31,17 @@ Optional quick version check:
 
 ### `config.yaml`
 
-Start from the typed example:
+For a direct run on the VDI host, start from the typed example:
 
 ```bash
 cp deploy/config.example.yaml ./config.yaml
+```
+
+For the one-microproxy-per-VDI container topology, start from the focused
+container profile instead:
+
+```bash
+cp deploy/config.vdi.container.example.yaml ./config.yaml
 ```
 
 Important fields to review in `config.yaml`:
@@ -44,7 +51,7 @@ Important fields to review in `config.yaml`:
 - `routing`: default provider and routing rules by tenant/host.
 - `policies`: allow/deny/header policies.
 - `tenants`: tenant-to-provider/policy binding.
-- `session_control`: VDI-local sticky rotation API (`127.0.0.1:8094`, `auth_type: bearer` by default, sticky provider). `auth_type: none` is loopback-only unless `allow_unauthenticated_non_loopback: true` is explicitly set. This protects the management API only; listener authentication protects downstream proxy clients.
+- `session_control`: VDI-local sticky rotation API (`127.0.0.1:8094` for a host run, `0.0.0.0:8094` on a private container network, `auth_type: bearer` by default, sticky provider). `auth_type: none` is loopback-only unless `allow_unauthenticated_non_loopback: true` is explicitly set. This protects the management API only; listener authentication protects downstream proxy clients.
 - `observability.health_endpoints`: liveness/readiness/startup ports. A non-empty `-health-addr` CLI flag overrides `liveness_address`; when omitted, the YAML value is used.
 
 > Tip: the example already includes single-provider, failover, and selenium-friendly scenarios as documented snippets, plus an active sticky VDI profile (`:8080`/`:8081`/`8094`).
@@ -69,6 +76,17 @@ Development-only mode (no explicit key set):
 
 - Set `MICROPROXY_DEVELOPMENT_MODE=true`
 - The default key becomes: `microproxy-controlplane-dev-key`
+
+### `vdi.env` (data-plane container deployments)
+
+```bash
+cp deploy/vdi.env.example ./vdi.env
+```
+
+Set a unique `MICROPROXY_SESSION_API_KEY` per VDI plus the upstream endpoint
+and base credentials. This is the bearer token CROWler sends to the data-plane
+rotation API; it is not a control-plane API key. Keep the file out of version
+control.
 
 ---
 
@@ -95,89 +113,48 @@ with a clear error.
 set -a
 source ./controlplane.env
 set +a
-./bin/microproxy-control -config ./config.yaml -listen-addr :8081
+./bin/microproxy-control -config ./config.yaml -listen-addr :8085
 ```
+
+Use `:8085` (not `:8081`) when microproxy and microproxy-control share a host
+network namespace: `:8081` is the sticky data-plane listener in the example
+configuration.
 
 ---
 
 ## 4) Build and run Docker containers
 
-The repository `Dockerfile` builds `microproxy`. For `microproxy-control`, use a small companion Dockerfile.
+The repository provides `Dockerfile.mp` for `microproxy` and
+`Dockerfile.mp-ctrl` for `microproxy-control`.
 
-### 4.1 Build `microproxy` image
-
-```bash
-docker build -t microproxy:local -f Dockerfile .
-```
-
-### 4.2 Build `microproxy-control` image
-
-Create `Dockerfile.control`:
-
-```dockerfile
-FROM golang:1.24-alpine AS builder
-WORKDIR /src
-
-ARG TARGETOS
-ARG TARGETARCH
-ARG TARGETVARIANT
-
-COPY go.mod go.sum ./
-RUN go mod download
-COPY . .
-RUN CGO_ENABLED=0 GOOS=${TARGETOS} GOARCH=${TARGETARCH} GOARM=${TARGETVARIANT} go build -o /out/microproxy-control ./cmd/microproxy-control
-
-FROM gcr.io/distroless/static-debian12:nonroot
-COPY --from=builder /out/microproxy-control /usr/local/bin/microproxy-control
-ENTRYPOINT ["/usr/local/bin/microproxy-control"]
-CMD ["-config", "/etc/microproxy/config.yaml", "-listen-addr", ":8081"]
-```
-
-Build it:
+### 4.1 Build images
 
 ```bash
-docker build -t microproxy-control:local -f Dockerfile.control .
+docker build -t microproxy:local -f Dockerfile.mp .
+docker build -t microproxy-control:local -f Dockerfile.mp-ctrl .
 ```
 
-### 4.3 Run containers together
+### 4.2 Run one stack per VDI
 
-Example `docker-compose.yml`:
-
-```yaml
-services:
-  microproxy:
-    image: microproxy:local
-    container_name: microproxy
-    env_file:
-      - ./controlplane.env
-      #- ../thecrowler/.env  # if you want to share env vars with the CROWler project
-    ports:
-      - "8084:8080" # downstream proxy listener
-      - "8090:8090" # liveness
-      - "8091:8091" # metrics
-      - "8092:8092" # readiness
-      - "8093:8093" # startup
-    volumes:
-      - ./config.yaml:/etc/microproxy/config.yaml:ro
-    command: ["-config", "/etc/microproxy/config.yaml", "-health-addr", ":9090"]
-
-  microproxy-control:
-    image: microproxy-control:local
-    container_name: microproxy-control
-    env_file:
-      - ./controlplane.env
-      #- ../thecrowler/.env  # if you want to share env vars with the CROWler project
-    ports:
-      - "8085:8081" # control-plane API
-    volumes:
-      - ./config.yaml:/etc/microproxy/config.yaml:ro
-    command: ["-config", "/etc/microproxy/config.yaml", "-listen-addr", ":8081"]
-```
-
-Start:
+Copy `deploy/config.vdi.container.example.yaml` to `./config.yaml` and
+`deploy/vdi.env.example` to `./vdi.env`, then:
 
 ```bash
-docker compose up -d
+docker compose up -d --build
+```
+
+The data-plane ports are intentionally not published. A sibling CROWler
+container on the same compose network uses:
+
+- Selenium/downstream proxy: `http://microproxy:8081`
+- Session rotation/status API: `http://microproxy:8094`
+
+Run one compose project per VDI. Never publish `8094`: it mutates that VDI's
+upstream identity and is protected only by its bearer token. For a local
+reachability check from a distinct container namespace:
+
+```bash
+docker compose --profile smoke run --rm vdi-smoke
 ```
 
 ---
@@ -194,14 +171,19 @@ ps -ef | rg "microproxy|microproxy-control"
 docker compose ps
 ```
 
-### Health and metrics checks
+### Health and metrics checks (direct host run)
 
 ```bash
-curl -i http://127.0.0.1:8090/healthz   # liveness (microproxy)
-curl -i http://127.0.0.1:8092/readyz    # readiness (microproxy)
-curl -i http://127.0.0.1:8093/startupz  # startup (microproxy)
-curl -i http://127.0.0.1:8091/metrics   # prometheus metrics
+curl -i http://127.0.0.1:9090/healthz   # liveness (microproxy)
+curl -i http://127.0.0.1:9092/readyz    # readiness (microproxy)
+curl -i http://127.0.0.1:9093/startupz  # startup (microproxy)
+curl -i http://127.0.0.1:9091/metrics   # prometheus metrics
 ```
+
+In container mode the data-plane ports are not published. Reach them from a
+sibling container at `http://microproxy:9090` … `:9093`, or use
+`docker compose --profile smoke run --rm vdi-smoke` for the authenticated
+session roundtrip.
 
 ### Control-plane reachability/auth checks
 
@@ -222,7 +204,7 @@ curl -i -H "X-API-Key: microproxy-controlplane-dev-key" http://127.0.0.1:8085/ap
 
 ## 6) Basic usage workflow
 
-1. Clients send proxy traffic to `microproxy` listener(s), for example `http://<host>:8084`.
+1. Clients send proxy traffic to `microproxy` listener(s): `http://<host>:8080` (rotating) or `:8081` (sticky) for a host run, or `http://microproxy:8080`/`:8081` from a sibling container.
 2. `microproxy` routes traffic using `routing` + `tenants` in `config.yaml`.
 3. `microproxy-control` exposes API operations for control/inspection (protected by key/JWT auth).
 4. Operators monitor health/metrics endpoints and adjust configuration as needed.
@@ -235,7 +217,13 @@ For a detailed control-plane usage guide (endpoint catalog, auth/roles, and depl
 
 ## Sticky/persistent-session rotation guide
 
-Microproxy allows the use of a sticky/persistent profile which can be mapped to different ports, e.g., `:8080` rotating, `:8081` sticky, and have a rotation request sent to `127.0.0.1:8094` rotation API., see [session-control.md](docs/session-control.md) and `api/session-control.openapi.yaml` for more details.
+Microproxy allows the use of a sticky/persistent profile which can be mapped to different ports, e.g., `:8080` rotating, `:8081` sticky, and have a rotation request sent to the data-plane session API (`127.0.0.1:8094` for a host run; `http://microproxy:8094` from a sibling container). See [session-control.md](docs/session-control.md) and `api/session-control.openapi.yaml` for more details.
+
+The rotation API is served by the **data-plane** process that owns the sticky
+listener. `microproxy-control`'s provider rotate/refresh routes remain contract
+stubs and must not be used by CROWler. Deploy one microproxy process per VDI:
+the pinned identity is scoped to the provider and process, not to an individual
+browser or source address.
 
 This function (when supported by the upstream proxy) allows rotating of a proxy session on demand without restarting the proxy.
 
@@ -253,7 +241,9 @@ Retrying the latest key returns the original generation with
 after a newer rotation returns `409 stale_idempotency_key` with
 `original_generation`/`current_generation`; identity and connections are left
 untouched. Keys beyond the bounded retention window (512 entries, 24h) are
-treated as new rotations. With `session_control.auth_type: none`, omit the
+treated as new rotations. Generation numbers and idempotency history are
+process-local and reset on restart, so CROWler must mint a fresh key after a
+proxy restart. With `session_control.auth_type: none`, omit the
 `Authorization` header (loopback binding only unless explicitly opted out).
 
 Persistent sessions can help maintain a consistent identity or connection state with the upstream proxy, which is useful for scenarios requiring session affinity or long-lived connections.

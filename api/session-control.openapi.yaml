@@ -34,6 +34,11 @@ paths:
         key returns 409 `stale_idempotency_key` with the original and current
         generations. Keys evicted beyond the bounded retention window
         (512 entries, 24h) are treated as new rotations.
+
+        State is process-local: a restart begins again at generation 1 and
+        forgets accepted keys, so clients must mint a fresh key after a restart.
+        A successful rotation changes the upstream credential but does not
+        guarantee a different public exit IP.
       parameters:
         - name: Authorization
           in: header
