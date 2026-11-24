@@ -18,22 +18,29 @@ username identities or same identities but different session requirements:
 
 - `:8080` (`edge-http`): rotating residential behavior, unchanged.
 - `:8081` (`edge-http-sticky`): sticky residential behavior. One active
-  logical session **per MicroProxy instance**, shared by all clients of that
-  port.
-- `127.0.0.1:8094` (default): data-plane-local session management API,
-  authenticated with Bearer by default. It mutates the **running data-plane
-  process**, not `microproxy-control` stubs.
+  logical session **per provider per MicroProxy process**, shared by all clients
+  of that port. It is not one identity per browser, tab or source address.
+- `127.0.0.1:8094` (host run) or `http://<microproxy-service>:8094` (sibling
+  container): data-plane-local session management API, authenticated with
+  Bearer by default. It mutates the **running data-plane process**, not
+  `microproxy-control` stubs.
 
 ## CROWler contract
 
 ```
 close old browser
-POST http://127.0.0.1:8094/api/v1/sessions/rotate
+POST <same-VDI-microproxy>/api/v1/sessions/rotate
   Authorization: Bearer <MICROPROXY_SESSION_API_KEY>
   Idempotency-Key: <unique-CROWler-job-boundary-id>
 wait for 200 {"status":"rotated","provider":"...","generation":N}
-start next browser (still via http://<host>:8081)
+start next browser (still via the same sticky listener, e.g. :8081)
 ```
+
+Use `http://127.0.0.1:8094` when CROWler runs directly on the VDI host and
+`http://<microproxy-VDI-service>:8094` when it runs in a sibling container on
+the same private network. The management endpoint must be the **same process**
+that serves the sticky listener; a different VDI's microproxy must never be
+used for the rotation.
 
 - The acknowledgement means new upstream operations *starting after the commit*
   use the new credentials. It does **not** mean upstream proxy pre-allocated or
@@ -55,9 +62,10 @@ start next browser (still via http://<host>:8081)
   or logs.
 - Rotation changes the upstream session identity; it **does not guarantee a
   different public IP** or that the upstream proxy retains an IP indefinitely.
-- One logical sticky session per VDI. Overlapping independent browser jobs
-  needing independent sticky IPs require a future per-client binding feature;
-  the global rotation API is insufficient for that.
+- One logical sticky identity per session-enabled provider in a microproxy
+  process, and one microproxy process per VDI. Overlapping independent browser
+  jobs needing independent sticky IPs require a future per-client binding
+  feature; the global rotation API is insufficient for that.
 
 ## Configuration
 
@@ -117,9 +125,10 @@ session_control:
 - `listeners[].provider` is optional for legacy deployments. When present it is
   a mandatory egress constraint, not a routing preference. `X-Provider-ID`,
   `X-Tenant-ID`, routing rules and `route_override` cannot escape it.
-- Only `mode: username_template` with `{{username}}` + `{{session_id}}`
-  enables runtime identity. `${...}` must not be used in the template because
-  config loading expands env vars; `{{...}}` is runtime-only.
+- `mode: username_template` (with `{{username}}` + `{{session_id}}`) and
+  `mode: credential_template` (with `auth.templates`) both enable runtime
+  identity. `${...}` must not be used in either template because config loading
+  expands env vars; `{{...}}` is runtime-only.
 - Base username must omit any existing `-session-` suffix (other
   country/zone parameters are preserved in the base).
 - Only `http_proxy`-compatible providers support session mode. `direct` and
@@ -135,6 +144,79 @@ session_control:
   mode, invalid sticky-provider config, duplicate listener names/addresses,
   unsafe unauthenticated non-loopback binding without opt-in, or a session API
   port colliding with enabled listeners, metrics, or another health endpoint.
+
+## Per-VDI deployment topology
+
+The supported topology is one CROWler VDI to one `microproxy` data-plane
+process. A process has one active identity per session-enabled provider, so
+multiplexing independent browser jobs through one process would make them
+share and rotate the same upstream credential. Do not do that.
+
+| Mode | Sticky proxy URL | Rotation API URL | Config example |
+|---|---|---|---|
+| Direct on VDI host | `http://127.0.0.1:8081` | `http://127.0.0.1:8094` | `deploy/config.example.yaml` |
+| CROWler in a sibling container | `http://<microproxy-service>:8081` | `http://<microproxy-service>:8094` | `deploy/config.vdi.container.example.yaml` |
+
+For containers:
+
+- Attach CROWler and microproxy to the same private Docker/Kubernetes network.
+- Bind `session_control.address` to a container-reachable address such as
+  `0.0.0.0:8094`, keep `auth_type: bearer` with a distinct
+  `MICROPROXY_SESSION_API_KEY` per VDI, and restrict ingress to that network.
+- Do **not** publish `8094` to the host or the internet. A container listener
+  bound to `127.0.0.1` inside the microproxy container is unreachable from a
+  sibling container even if a host port is published for it.
+- Keep a `listeners[].provider` binding on the sticky listener. A client-supplied
+  `X-Provider-ID` or `X-Tenant-ID` cannot escape it.
+- Use a separate compose project/stack per VDI, or a per-VDI Kubernetes
+  Deployment/Service, so a job cannot rotate another VDI's proxy by address
+  mix-up. The rotation request has no tenant field: if CROWler sends it to the
+  wrong VDI's host, that VDI's identity is rotated. Correct per-VDI routing and
+  a distinct bearer token per VDI are the safeguards; there is no fleet-wide
+  registry that can detect a misaddressed request.
+
+The repository's `docker-compose.yml` follows this model: no data-plane ports
+are published, and the optional `vdi-smoke` profile runs the authenticated
+rotate/status roundtrip from a distinct container namespace:
+
+```bash
+cp deploy/config.vdi.container.example.yaml ./config.yaml
+cp deploy/vdi.env.example ./vdi.env
+docker compose up -d --build
+docker compose --profile smoke run --rm vdi-smoke
+```
+
+### Restart semantics
+
+`generation` and the idempotency-key history live only in the running process.
+A restart starts a new identity at generation 1 and forgets previously accepted
+keys. CROWler must therefore:
+
+- derive a fresh job-boundary key for the first rotation after a restart, and
+- treat a connection failure or an unexpectedly low generation as a new process,
+  not as evidence that an earlier rotation is still current.
+
+There is no shared/distributed sticky state in this release. Active/active
+replicas behind one service name are not supported for sticky sessions.
+
+## Call-flow map
+
+The runtime path for the documented contract is:
+
+1. Listener `edge-http-sticky` is started with a trusted hard binding to the
+   sticky provider (`ListenerBindingMiddleware`).
+2. `ForwardProxyHandler` resolves the bound provider and pins
+   `SessionManager.Snapshot(provider)` once into the request context.
+3. `httpProxyAdapter.effectiveCredentials` renders the pinned session id through
+   `session.username_template` (or `auth.templates` in `credential_template`
+   mode) and sets `Proxy-Authorization` for the upstream HTTP request or CONNECT
+   handshake.
+4. `POST /api/v1/sessions/rotate` on the same process calls
+   `SessionManager.Rotate`, which advances generation and stores the new
+   identity under the idempotency key. Only a new rotation triggers idle
+   connection cleanup; established CONNECT tunnels are left alone.
+5. New upstream operations take a fresh snapshot and use the new credential.
+   A request or tunnel that pinned the old snapshot finishes with it.
 
 ## Generic credential templating (`mode: credential_template`)
 
@@ -187,6 +269,11 @@ session:
 - Short identifiers (for example a 6-character id, ~29 bits) collide with
   non-negligible probability after roughly 2^15 draws; prefer longer
   identifiers for strong stickiness.
+- Rotation guarantees that the committed identifier differs from the current
+  one. If a short identifier produces a duplicate, generation is retried a
+  bounded number of times and rotation fails closed with `503` rather than
+  silently returning an unchanged credential. A distinct credential still does
+  not guarantee a distinct public IP.
 
 ## HTTP contract
 
@@ -218,15 +305,79 @@ For separate network namespace/container deployments prefer bearer auth on a
 private network with restricted ingress; do not expose `0.0.0.0` without
 controls.
 
+## Metrics and audit
+
+When `observability.metrics.enabled` is set, the data plane exposes:
+
+- `microproxy_session_rotations_total{provider,outcome}` with the fixed
+  outcomes `rotated`, `replayed`, `stale`, `unauthorized`, `invalid` and
+  `failed`.
+- `microproxy_upstream_endpoint_attempts_total{provider,endpoint,outcome}` with
+  `success`/`failure`, where `endpoint` is the configured upstream host name.
+
+Rotation audit logs contain the provider and generation only. Idempotency
+keys, raw session ids, rendered usernames, passwords and authorization headers
+are never used as metric labels or emitted in rotation logs or API responses.
+
+## Live provider verification (opt-in)
+
+The repository includes an opt-in live smoke test. It is skipped by default and
+never runs in CI:
+
+```bash
+MICROPROXY_LIVE_SMOKE=1 \
+MICROPROXY_LIVE_UPSTREAM_URL='http://provider-gateway.example:3128' \
+MICROPROXY_LIVE_UPSTREAM_USER='base-user' \
+MICROPROXY_LIVE_UPSTREAM_PASSWORD='base-password' \
+MICROPROXY_LIVE_ECHO_URL='https://api.ipify.org?format=text' \
+go test ./internal/dataplane -run TestLiveUpstreamStickySmoke -v
+```
+
+The upstream URL must not embed credentials. Configure the provider-specific
+grammar with `MICROPROXY_LIVE_SESSION_MODE` and either
+`MICROPROXY_LIVE_USERNAME_TEMPLATE` (legacy mode) or
+`MICROPROXY_LIVE_TEMPLATE_USERNAME`/`MICROPROXY_LIVE_TEMPLATE_PASSWORD`
+(generic mode). The test reports three separate facts:
+
+- `identity_changed`: the local pinned credential was replaced;
+- `post_rotation_upstream_connection_succeeded`: the upstream accepted the new
+  credential on a new connection;
+- `observed_public_ip_changed`: the IP echo observation differs after rotation.
+
+The last value may be false even when rotation is correct. The test performs one
+post-rotation observation and does not retry until a different IP appears;
+respect provider quotas and terms.
+
+## Verification commands
+
+The deterministic suite is CI-safe:
+
+```bash
+go test ./...
+go test -race ./...
+go vet ./...
+staticcheck ./...
+```
+
+`go test ./cmd/microproxy -run TestProcessStickySessionContract -v` launches the
+real microproxy bootstrapping in a child process, drives the authenticated HTTP
+rotation endpoint, and checks HTTP, CONNECT, idempotency, auth, spoofing,
+shutdown and no-secret-leak behaviour against a mock upstream.
+
 ## Operational notes
 
 - Residential peers expire; different session IDs may reuse an IP and restart
-  creates a new identity (generation resets to 1).
+  creates a new identity (generation resets to 1). Idempotency history is also
+  lost on restart; evicted keys are treated as new rotations.
 - In-flight HTTP completes with its pinned identity or begins with the new
   one; identities never mix within one operation. Sticky HTTP disables upstream
   keep-alives so pooled connections cannot reuse old auth; idle connections are
   closed only after a successful new rotation. Replays, stale keys and failed
-  rotations never trigger connection cleanup.
+  rotations never trigger connection cleanup. Rotation never closes an
+  established CONNECT tunnel.
+- Behavior is unchanged when `session_control` is disabled or when traffic uses
+  a non-sticky provider: those paths keep their documented static credential
+  and routing behavior.
 - `microproxy-control` `POST /providers/{id}/rotate` and
   `/sessions/{sid}/refresh` remain async contract stubs for the control
   process and do not rotate data-plane sticky identity. See

@@ -42,7 +42,8 @@ FROM ${RUNTIME_IMAGE}
 WORKDIR /app
 
 COPY --from=builder /out/microproxy /usr/local/bin/microproxy
-COPY --from=builder /src/config.yaml /etc/microproxy/config.yaml
 
+# Configuration is mounted at runtime (see docker-compose.yml) so credentials
+# are never baked into an image layer.
 ENTRYPOINT ["/usr/local/bin/microproxy"]
 CMD ["-config", "/etc/microproxy/config.yaml", "-health-addr", ":9090"]

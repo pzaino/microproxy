@@ -18,11 +18,18 @@ const (
 	idempotencyTTL = 24 * time.Hour
 	// maxIdempotencyKeyLen bounds key size to prevent memory abuse.
 	maxIdempotencyKeyLen = 256
+	// maxSessionIDGenerationAttempts bounds how often Rotate retries when the
+	// generator produces the identity already in use. Short identifiers (for
+	// example one numeric character) collide often, but a rotation that leaves
+	// the credential unchanged is not a rotation. Retrying a small, fixed number
+	// of times keeps a hostile configuration from spinning and still fails
+	// closed if no distinct identity can be produced.
+	maxSessionIDGenerationAttempts = 8
 )
 
 // SessionManager holds instance-local, provider-scoped sticky identities.
-// Only providers explicitly configured with session mode username_template
-// have an active dynamic identity.
+// Only providers explicitly configured with a runtime session mode
+// (username_template or credential_template) have an active dynamic identity.
 type SessionManager struct {
 	mu        sync.RWMutex
 	states    map[string]*sessionProviderState
@@ -126,6 +133,26 @@ func generateSessionID(randFn func(int) ([]byte, error), idCfg config.SessionIDC
 	return config.GenerateSessionID(randFn, idCfg)
 }
 
+// generateDistinctSessionID generates a replacement identity that differs from
+// the one currently pinned. RNG failures and empty identities fail closed
+// immediately; a duplicate value is retried a bounded number of times so short,
+// operator-selected identifiers do not silently turn a rotation into a no-op.
+func generateDistinctSessionID(randFn func(int) ([]byte, error), idCfg config.SessionIDConfig, previous string) (string, error) {
+	for attempt := 0; attempt < maxSessionIDGenerationAttempts; attempt++ {
+		candidate, err := generateSessionID(randFn, idCfg)
+		if err != nil {
+			return "", fmt.Errorf("generate session identity: %w", err)
+		}
+		if strings.TrimSpace(candidate) == "" {
+			return "", fmt.Errorf("generated empty session identity")
+		}
+		if candidate != previous {
+			return candidate, nil
+		}
+	}
+	return "", fmt.Errorf("generate session identity: no identity distinct from the current generation after %d attempts", maxSessionIDGenerationAttempts)
+}
+
 // Snapshot returns the current pinned identity for a session-enabled provider.
 // ok=false when the provider has no active dynamic identity.
 func (m *SessionManager) Snapshot(provider string) (listeners.SessionSnapshot, bool) {
@@ -145,10 +172,13 @@ func (m *SessionManager) Snapshot(provider string) (listeners.SessionSnapshot, b
 	return listeners.SessionSnapshot{Provider: name, SessionID: state.sessionID, Generation: state.generation}, true
 }
 
-// Rotate atomically advances the sticky identity for provider. The most recent
-// idempotency key returns its prior generation without rotating again; a key
-// from an older generation returns *StaleIdempotencyKeyError. On RNG failure
-// the previous state is preserved and an error returned.
+// Rotate atomically advances the sticky identity for provider. The generated
+// identity is guaranteed to differ from the current one; short identifiers are
+// retried a bounded number of times and the rotation fails closed if no
+// distinct value is produced. The most recent idempotency key returns its prior
+// generation without rotating again; a key from an older generation returns
+// *StaleIdempotencyKeyError. On RNG or collision failure the previous state is
+// preserved and an error returned.
 func (m *SessionManager) Rotate(provider, idempotencyKey string) (listeners.SessionSnapshot, bool, error) {
 	name := strings.TrimSpace(provider)
 	if name == "" {
@@ -178,12 +208,9 @@ func (m *SessionManager) Rotate(provider, idempotencyKey string) (listeners.Sess
 		}
 		return listeners.SessionSnapshot{Provider: name, SessionID: entry.sessionID, Generation: entry.generation}, true, nil
 	}
-	sessionID, err := generateSessionID(m.randBytes, state.idCfg)
+	sessionID, err := generateDistinctSessionID(m.randBytes, state.idCfg, state.sessionID)
 	if err != nil {
-		return listeners.SessionSnapshot{}, false, fmt.Errorf("generate session identity: %w", err)
-	}
-	if strings.TrimSpace(sessionID) == "" {
-		return listeners.SessionSnapshot{}, false, fmt.Errorf("generated empty session identity")
+		return listeners.SessionSnapshot{}, false, err
 	}
 	state.generation++
 	state.sessionID = sessionID

@@ -11,6 +11,11 @@
 #   127.0.0.1:8094        -> authenticated data-plane session management API
 # CROWler contract: close old browser -> POST /api/v1/sessions/rotate
 #   with Idempotency-Key -> wait for 200 -> start next browser.
+#
+# This file binds the session API to loopback and is intended for direct
+# (non-container) runs on the VDI host. For one-microproxy-per-VDI containers,
+# use deploy/config.vdi.container.example.yaml, which binds 0.0.0.0:8094 so a
+# sibling CROWler container can reach it over a private network.
 
 schema_version: "1"
 
@@ -195,7 +200,8 @@ tenants:
 # Disabled by default; enable only with a strong bearer token and loopback
 # (or private-network) binding. It rotates the SAME process that serves :8081.
 # microproxy-control provider rotation stubs are a separate contract and do not
-# mutate this runtime.
+# mutate this runtime. A container deployment needs a container-reachable bind
+# (0.0.0.0) on a private network; see deploy/config.vdi.container.example.yaml.
 # listener auth_type protects downstream proxy clients; session_control
 # auth_type protects this management API. They are independent.
 # auth_type: bearer (default when omitted) requires a non-empty bearer_token.

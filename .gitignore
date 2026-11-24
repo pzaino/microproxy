@@ -11,8 +11,8 @@ coverage.out
 # old files
 *.old
 
-# build and testing artifacts
+# build and testing artifacts (root binaries only; keep cmd/microproxy tracked)
 config.yaml
-microproxy
-microproxy-control
+/microproxy
+/microproxy-control
 

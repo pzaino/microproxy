@@ -12,6 +12,7 @@ import (
 
 	"github.com/pzaino/microproxy/internal/dataplane/listeners"
 	"github.com/pzaino/microproxy/internal/dataplane/policy"
+	"github.com/pzaino/microproxy/internal/observability"
 	"github.com/pzaino/microproxy/pkg/config"
 )
 
@@ -312,6 +313,10 @@ func (r *ProviderRegistry) ObserveEndpointOutcome(provider string, endpoint *url
 	if endpoint == nil {
 		return
 	}
+	// Endpoint hostnames come from validated configuration and are bounded per
+	// provider; never use the rendered credential or a client-supplied value as a
+	// metric label.
+	observability.RecordEndpointOutcome(provider, endpoint.Hostname(), err)
 	now := r.now().UTC()
 	r.mu.Lock()
 	defer r.mu.Unlock()

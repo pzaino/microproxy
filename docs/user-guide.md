@@ -177,8 +177,10 @@ kernel choose an ephemeral port.
 ### 7) Session Control
 
 `session_control` enables the data-plane-local sticky-session management API
-(default `127.0.0.1:8094`) used to rotate the upstream identity of a
-session-enabled provider without restarting the process:
+(default loopback `127.0.0.1:8094` for host runs) used to rotate the upstream
+identity of a session-enabled provider without restarting the process. It is
+served by the same process as the sticky listener, not by
+`microproxy-control`.
 
 ```yaml
 session_control:
@@ -211,6 +213,16 @@ session_control:
 - Rotate the session only after closing the old browser, and start the next
   browser after the 200 acknowledgement. Established CONNECT tunnels survive
   rotation; new requests use the new identity.
+- One microproxy process has one sticky identity per provider. Run one process
+  per CROWler VDI; do not share it between independent browser jobs.
+- In a container deployment, bind the session API to a container-reachable
+  address on a private network (for example `0.0.0.0:8094`) with bearer auth,
+  and do not publish that port. A listener bound to `127.0.0.1` inside the
+  microproxy container is not reachable from a sibling CROWler container.
+  `deploy/config.vdi.container.example.yaml` and the repository
+  `docker-compose.yml` show this topology.
+- Generation numbers and idempotency history are process-local and reset on
+  restart. Mint a fresh key after a restart.
 
 See `docs/session-control.md` for the full CROWler contract and
 `api/session-control.openapi.yaml` for the API schema.
@@ -272,8 +284,11 @@ so conflicting ports fail fast with a clear startup error.
 set -a
 source ./controlplane.env
 set +a
-./bin/microproxy-control -config ./config.yaml -listen-addr :8081
+./bin/microproxy-control -config ./config.yaml -listen-addr :8085
 ```
+
+Use `:8085` when the data plane already uses `:8081` for its sticky listener on
+the same host.
 
 ### Step 6: Verify service health
 
@@ -287,7 +302,7 @@ curl -i http://127.0.0.1:9091/metrics
 Control plane health:
 
 ```bash
-curl -i http://127.0.0.1:8081/api/v1/health
+curl -i http://127.0.0.1:8085/api/v1/health
 ```
 
 ---
@@ -295,15 +310,20 @@ curl -i http://127.0.0.1:8081/api/v1/health
 ## Step-by-Step: Deploy with Docker Compose
 
 For most teams, Compose is the fastest path to repeatable local/staging deployment.
+The provided `docker-compose.yml` represents one MicroProxy per CROWler VDI on
+a private network.
 
 ### Step 1: Prepare config and env files
 
 ```bash
-cp deploy/config.example.yaml ./config.yaml
+cp deploy/config.vdi.container.example.yaml ./config.yaml
+cp deploy/vdi.env.example ./vdi.env
 cp deploy/controlplane.env.example ./controlplane.env
 ```
 
-Update credentials, endpoints, and security settings.
+Set a unique `MICROPROXY_SESSION_API_KEY` per VDI plus the upstream endpoint and
+base credentials. Update the session template for the provider's actual sticky
+syntax. Keep `vdi.env` out of version control.
 
 ### Step 2: Build and start
 
@@ -319,19 +339,26 @@ docker compose logs --tail=100 microproxy
 docker compose logs --tail=100 microproxy-control
 ```
 
-### Step 4: Validate mapped endpoints
+### Step 4: Validate the private container endpoints
 
-Data plane and observability endpoints (example mappings):
+Data-plane ports are not published. A sibling CROWler container uses:
 
-- downstream listener: `:8084`
-- liveness: `:8090`
-- metrics: `:8091`
-- readiness: `:8092`
-- startup: `:8093`
+- sticky downstream proxy: `http://microproxy:8081`
+- session rotation/status API: `http://microproxy:8094`
+- rotating downstream proxy: `http://microproxy:8080`
 
-Control plane API endpoint (example mapping):
+Run the distinct-container reachability check (authenticated status + rotate):
 
-- control API: `:8085`
+```bash
+docker compose --profile smoke run --rm vdi-smoke
+```
+
+The control plane is published on host loopback only:
+
+- control API: `http://127.0.0.1:8085`
+
+Do not publish the session API (`8094`) to the host or internet. Use a separate
+compose project per VDI so one CROWler job cannot rotate another VDI's identity.
 
 ---
 

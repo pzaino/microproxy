@@ -1,0 +1,104 @@
+# MicroProxy per-VDI container configuration example.
+#
+# Run exactly one microproxy process for each CROWler VDI. The sticky identity
+# is scoped to (provider, process); sharing one process between VDIs would make
+# every VDI rotate the same upstream credentials.
+#
+# Container reachability:
+#   CROWler container -> http://<microproxy-service>:8081  (Selenium proxy URL)
+#   CROWler container -> http://<microproxy-service>:8094  (rotate/status API)
+#
+# The session API intentionally binds 0.0.0.0 here so a sibling container on the
+# same private Docker/Kubernetes network can reach it. It MUST stay on that
+# private network: bearer authentication is mandatory and the port must not be
+# published to the host or the public internet. For a direct (non-container) run
+# keep 127.0.0.1:8094 as shown in deploy/config.example.yaml.
+schema_version: "1"
+
+listeners:
+  - name: edge-http
+    type: http
+    address: 0.0.0.0:8080
+    provider: residential-rotating
+    auth_type: none
+    enabled: true
+
+  - name: edge-http-sticky
+    type: http
+    address: 0.0.0.0:8081
+    provider: residential-sticky
+    auth_type: none
+    enabled: true
+
+providers:
+  - name: residential-rotating
+    type: http_proxy
+    auth:
+      type: basic
+      username: ${MICROPROXY_UPSTREAM_USER}
+      password: ${MICROPROXY_UPSTREAM_PASSWORD}
+    endpoints:
+      - url: ${MICROPROXY_UPSTREAM_ENDPOINT}
+    capabilities: ["forward_proxy"]
+    health:
+      enabled: false
+
+  - name: residential-sticky
+    type: http_proxy
+    auth:
+      # Base username without any sticky-session suffix. The runtime appends the
+      # per-process session id. Adjust mode/templates for your provider; see
+      # docs/generic-credential-templates.md.
+      type: basic
+      username: ${MICROPROXY_UPSTREAM_USER}
+      password: ${MICROPROXY_UPSTREAM_PASSWORD}
+    session:
+      supported: true
+      mode: username_template
+      username_template: "{{username}}-session-{{session_id}}"
+    endpoints:
+      - url: ${MICROPROXY_UPSTREAM_ENDPOINT}
+    capabilities: ["forward_proxy"]
+    health:
+      enabled: false
+
+routing:
+  default_provider: residential-rotating
+  rules:
+    - name: vdi-sticky
+      match:
+        tenant_id: tenant-sticky
+      provider: residential-sticky
+      policy_ref: allow-default
+
+policies:
+  - name: allow-default
+    type: base
+    action: allow
+
+tenants:
+  - name: tenant-sticky
+    id: tenant-sticky
+    providers: [residential-sticky]
+    policies: [allow-default]
+
+session_control:
+  enabled: true
+  address: 0.0.0.0:8094
+  auth_type: bearer
+  bearer_token: ${MICROPROXY_SESSION_API_KEY}
+  provider: residential-sticky
+
+observability:
+  access_log:
+    enabled: true
+    format: json
+  metrics:
+    enabled: true
+    address: 0.0.0.0:9091
+  tracing:
+    enabled: false
+  health_endpoints:
+    liveness_address: 0.0.0.0:9090
+    readiness_address: 0.0.0.0:9092
+    startup_address: 0.0.0.0:9093
